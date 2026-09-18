@@ -478,8 +478,18 @@
     var pointPaiement = totalPaiement*r.paiement;
     var salaireCoupeur = totalRecette*r.coupeur;
     var salaireMensuel = montantLonaci - salaireCoupeur;
-    return {totalRecette:totalRecette, totalPaiement:totalPaiement, montantTotal:montantTotal,
-      montantLonaci:montantLonaci, pointPaiement:pointPaiement, salaireCoupeur:salaireCoupeur, salaireMensuel:salaireMensuel};
+    // Arrondi au franc CFA près ici (et non seulement à l'affichage) : les cumuls et
+    // totaux additionnent ensuite exactement les mêmes valeurs que celles affichées,
+    // sans écart d'arrondi.
+    return {
+      totalRecette: Math.round(totalRecette),
+      totalPaiement: Math.round(totalPaiement),
+      montantTotal: Math.round(montantTotal),
+      montantLonaci: Math.round(montantLonaci),
+      pointPaiement: Math.round(pointPaiement),
+      salaireCoupeur: Math.round(salaireCoupeur),
+      salaireMensuel: Math.round(salaireMensuel)
+    };
   }
 
   function activityTotalsForMonth(activity, month){
@@ -745,24 +755,22 @@
     ];
     var html = '<thead><tr><th style="width:130px;">Mois</th>';
     cols.forEach(function(c){ html += '<th class="num">'+c.label+'</th>'; });
-    html += '<th class="num">Cumul salaire mensuel</th></tr></thead><tbody>';
+    html += '</tr></thead><tbody>';
 
     var totals = {}; cols.forEach(function(c){ totals[c.k]=0; });
-    var cumul = 0;
     MONTHS.forEach(function(month){
       var rowTotals = {}; cols.forEach(function(c){ rowTotals[c.k]=0; });
       STATE.activities.forEach(function(a){
         var t = activityTotalsForMonth(a, month);
         cols.forEach(function(c){ rowTotals[c.k]+=t[c.k]; });
       });
-      cumul += rowTotals.salaireMensuel;
       html += '<tr><td>'+month+'</td>';
       cols.forEach(function(c){ totals[c.k]+=rowTotals[c.k]; html += '<td class="num">'+fmtFCFA(rowTotals[c.k])+'</td>'; });
-      html += '<td class="num">'+fmtFCFA(cumul)+'</td></tr>';
+      html += '</tr>';
     });
     html += '<tr class="grand-row"><td>Total général annuel</td>';
     cols.forEach(function(c){ html += '<td class="num">'+fmtFCFA(totals[c.k])+'</td>'; });
-    html += '<td class="num">'+fmtFCFA(cumul)+'</td></tr></tbody>';
+    html += '</tr></tbody>';
     document.getElementById('consolidation-table').innerHTML = html;
   }
 
