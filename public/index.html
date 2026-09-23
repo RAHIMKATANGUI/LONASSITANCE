@@ -735,14 +735,20 @@
   function renderSaisieCards(){
     var t = computeTotals(draftDays, getActivityRates(current.activity));
     var cards = [
-      {label:'Total recette', value: fmtFCFA(t.totalRecette), cls:''},
-      {label:'Total paiement', value: fmtFCFA(t.totalPaiement), cls:''},
-      {label:'Montant total', value: fmtFCFA(t.montantTotal), cls:''},
-      {label:'Montant total LONACI', value: fmtFCFA(t.montantLonaci), cls:''},
-      {label:'Point paiement', value: fmtFCFA(t.pointPaiement), cls:'accent'},
-      {label:'Salaire coupeur', value: fmtFCFA(t.salaireCoupeur), cls:'accent'},
-      {label:'Salaire mensuel', value: fmtFCFA(t.salaireMensuel), cls:'hero'}
+      {k:'totalRecette', label:'Total recette', value: fmtFCFA(t.totalRecette), cls:''},
+      {k:'totalPaiement', label:'Total paiement', value: fmtFCFA(t.totalPaiement), cls:''},
+      {k:'montantTotal', label:'Montant total', value: fmtFCFA(t.montantTotal), cls:''},
+      {k:'montantLonaci', label:'Montant total LONACI', value: fmtFCFA(t.montantLonaci), cls:''},
+      {k:'pointPaiement', label:'Point paiement', value: fmtFCFA(t.pointPaiement), cls:'accent'},
+      {k:'salaireCoupeur', label:'Salaire coupeur', value: fmtFCFA(t.salaireCoupeur), cls:'accent'},
+      {k:'salaireMensuel', label:'Salaire mensuel', value: fmtFCFA(t.salaireMensuel), cls:'hero'}
     ];
+    var isAdmin = SESSION && SESSION.role === 'admin';
+    var allowedKeys = ['totalRecette', 'salaireCoupeur'];
+    if(!isAdmin){
+      cards = cards.filter(function(c){ return allowedKeys.indexOf(c.k) !== -1; });
+      cards.forEach(function(c){ if(c.k === 'salaireCoupeur') c.cls = 'hero'; });
+    }
     var wrap = document.getElementById('saisie-cards');
     wrap.innerHTML = '';
     cards.forEach(function(c){
