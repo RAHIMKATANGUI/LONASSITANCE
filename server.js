@@ -26,6 +26,39 @@ const SESSION_COOKIE = 'lonaloto_session';
 const SESSION_DURATION_MS = 2 * 60 * 60 * 1000; // 2 heures d'inactivité max
 const DEFAULT_PASSWORD = '123456789';
 
+// Reproduit exactement le calcul de date du front-end (voir monthMeta() dans public/index.html) :
+// les mois vont de JUILLET 2026 (index 0) à JUILLET 2027, dans l'ordre.
+function monthDate(months, monthLabel, day) {
+  const idx = months.indexOf(monthLabel);
+  if (idx === -1) return null;
+  const startY = 2026, startM = 6; // juillet, 0-indexé
+  const total = startM + idx;
+  const y = startY + Math.floor(total / 12);
+  const m = total % 12;
+  return new Date(y, m, day);
+}
+
+// Pour un compte activité : remplace, dans "incoming", toute journée déjà passée par la valeur
+// actuellement enregistrée côté serveur — un compte activité ne peut jamais modifier le passé,
+// même en trafiquant la requête. Seul l'admin peut corriger une journée passée (autre route).
+function enforceMidnightLock(months, existingActivityData, incomingActivityData) {
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const result = {};
+  for (const month of Object.keys(incomingActivityData)) {
+    const incomingDays = incomingActivityData[month];
+    const existingDays = (existingActivityData && existingActivityData[month]) || [];
+    if (!Array.isArray(incomingDays)) continue;
+    result[month] = incomingDays.map((pair, idx) => {
+      const day = idx + 1;
+      const cellDate = monthDate(months, month, day);
+      const isPast = cellDate && cellDate.getTime() < today.getTime();
+      if (isPast && existingDays[idx]) return existingDays[idx]; // ignore toute modification du passé
+      return pair;
+    });
+  }
+  return result;
+}
+
 // ============================================================
 // Schéma (phase 1 : authentification de base, sur l'état existant)
 // ============================================================
@@ -301,7 +334,8 @@ app.put('/api/state', requireAuth, async (req, res) => {
     if (!ownIncoming) return res.status(400).json({ error: 'invalid_body' });
 
     full.data = full.data || {};
-    full.data[nom] = ownIncoming;
+    const existingOwn = full.data[nom] || {};
+    full.data[nom] = enforceMidnightLock(full.months || [], existingOwn, ownIncoming);
 
     await pool.query(
       `INSERT INTO app_state (id, data, updated_at) VALUES (1, $1, now())
