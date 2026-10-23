@@ -202,9 +202,6 @@
   }
   .cell-input:hover{ border-color:var(--line); }
   .cell-input:focus{ border-color:var(--gold); background:var(--paper); outline:none; }
-  tr.locked-row{ background: color-mix(in srgb, var(--line-soft) 60%, transparent) !important; }
-  tr.locked-row td.rowdate{ color:var(--ink-soft); font-style:italic; }
-  .cell-input:disabled{ color:var(--ink-soft); background:transparent; cursor:not-allowed; }
 
   .table-scroll{ max-height:56vh; overflow:auto; }
   .table-scroll thead th{ position:sticky; top:0; z-index:2; }
@@ -276,23 +273,20 @@
   .act-card .name-row input[type=text]{ flex:1; width:auto; font-family:"Spectral", serif; font-size:15px; font-weight:600; }
   .act-card .del-btn{ padding:6px 10px; flex:none; }
 
+  .subtabs{ display:flex; gap:6px; flex-wrap:wrap; margin:0 0 20px 0; }
+  .accounts-table td, .accounts-table th{ vertical-align:middle; }
+  .accounts-table .acc-name{ font-weight:600; }
+  .accounts-table .acc-sub{ display:block; font-size:11px; color:var(--ink-soft); font-weight:400; margin-top:2px; }
+  .pw-tag{ display:inline-block; font-size:11.5px; padding:3px 8px; border-radius:10px; border:1px solid var(--line); white-space:nowrap; }
+  .pw-tag.temp{ border-color:var(--gold); color:var(--gold); }
+  .pw-tag.perso{ border-color:var(--pine); color:var(--pine); }
+  .accounts-table select{ min-width:0; }
+  .acc-banner{ display:none; margin:0 0 16px 0; padding:10px 14px; border-radius:4px; font-size:13px; max-width:900px; }
+  .acc-banner.ok{ display:block; background:color-mix(in srgb, var(--pine) 14%, transparent); border-left:3px solid var(--pine); color:var(--ink); }
+  .acc-banner.err{ display:block; background:color-mix(in srgb, var(--red-ink) 14%, transparent); border-left:3px solid var(--red-ink); color:var(--ink); }
+
   footer.appfoot{
     text-align:center; color:var(--ink-soft); font-size:11px; padding:20px;
-  }
-
-  @media print{
-    body.printing-consolidation .flagbar,
-    body.printing-consolidation #conn-status,
-    body.printing-consolidation .topbar,
-    body.printing-consolidation #export-wrap,
-    body.printing-consolidation #create-month-wrap,
-    body.printing-consolidation footer.appfoot{ display:none !important; }
-    body.printing-consolidation main{ padding:0; max-width:none; }
-    body.printing-consolidation .view{ display:none !important; }
-    body.printing-consolidation #view-consolidation{ display:block !important; }
-    body.printing-consolidation .table-scroll{ max-height:none !important; overflow:visible !important; }
-    body.printing-consolidation table{ font-size:11px; }
-    body.printing-consolidation thead th{ position:static; }
   }
 
   @media (max-width: 680px){
@@ -331,7 +325,7 @@
     <!-- Écran de changement de mot de passe obligatoire (affiché après une 1ère connexion) -->
     <form id="change-password-form" style="display:none; background:var(--white); border-radius:6px; padding:26px 24px; border:1px solid var(--line);">
       <h2 class="serif" style="margin:0 0 8px 0; font-size:18px; color:var(--ink);">Choisissez un mot de passe</h2>
-      <p style="font-size:12.5px; color:var(--ink-soft); margin:0 0 18px 0;">C'est votre première connexion — remplacez le mot de passe par défaut par le vôtre (6 caractères minimum).</p>
+      <p style="font-size:12.5px; color:var(--ink-soft); margin:0 0 18px 0;">Votre mot de passe actuel est temporaire (première connexion ou réinitialisation) — remplacez-le par le vôtre (6 caractères minimum).</p>
       <div class="field" style="margin-bottom:14px;">
         <label for="new-password-1">Nouveau mot de passe</label>
         <input type="password" id="new-password-1" autocomplete="new-password" required style="width:100%;">
@@ -432,7 +426,7 @@
     <!-- SYNTHESE -->
     <section class="view" id="view-synthese">
       <h1 class="page-title serif">Synthèse mensuelle</h1>
-      <p class="page-desc">Vue consolidée des quatre points d'activité pour le mois choisi.</p>
+      <p class="page-desc">Vue consolidée de tous les points d'activité pour le mois choisi.</p>
       <div class="controls-row">
         <div class="field">
           <label for="synthese-month">Mois</label>
@@ -445,24 +439,29 @@
     <!-- CONSOLIDATION -->
     <section class="view" id="view-consolidation">
       <h1 class="page-title serif">Consolidation globale</h1>
-      <p class="page-desc">Suivi des mois ouverts à la saisie, de juillet 2026 à juillet 2027 au plus tard — total général, 100% automatique. Les mois pas encore ouverts n'apparaissent pas.</p>
-
-      <div id="export-wrap" data-role="admin" class="controls-row" style="margin-bottom:14px;">
-        <button class="btn ghost" id="export-excel-btn">⭳ Exporter en Excel</button>
-        <button class="btn ghost" id="export-pdf-btn">⭳ Exporter en PDF</button>
-      </div>
-
+      <p class="page-desc">Suivi des 13 mois, juillet 2026 à juillet 2027 — total général, 100% automatique.</p>
       <div class="table-wrap"><div class="table-scroll" style="max-height:70vh;"><table id="consolidation-table"></table></div></div>
-
-      <div id="create-month-wrap" data-role="admin" class="savebar" style="max-width:900px;">
-        <button class="btn gold" id="create-month-btn">CRÉATION DU MOIS SUIVANT</button>
-        <span class="msg" id="create-month-status"></span>
-      </div>
     </section>
 
     <!-- PARAMETRES -->
     <section class="view" id="view-parametres">
       <h1 class="page-title serif">Paramètres</h1>
+
+      <div class="subtabs pillset" id="params-subtabs">
+        <button type="button" class="pill active" data-sub="activites">Activités &amp; taux</button>
+        <button type="button" class="pill" data-sub="comptes">GESTION DES COMPTES</button>
+      </div>
+
+      <div id="sub-comptes" style="display:none;">
+        <p class="page-desc" id="accounts-desc"></p>
+        <div class="acc-banner" id="accounts-banner" role="status" aria-live="polite"></div>
+        <div class="table-wrap" style="max-width:900px;"><div style="overflow-x:auto;">
+          <table class="accounts-table" id="accounts-table"></table>
+        </div></div>
+        <p class="page-desc" style="margin-top:14px;">Par sécurité, les mots de passe sont enregistrés chiffrés : personne, ni l'admin ni le serveur, ne peut les relire. La colonne indique donc leur état. Après une réinitialisation, l'utilisateur se connecte avec <strong>000000000</strong> et doit aussitôt choisir son propre mot de passe.</p>
+      </div>
+
+      <div id="sub-activites">
       <p class="page-desc">Chaque activité a son propre nom et ses propres taux de calcul de la paie.</p>
 
       <div class="params-grid" id="activities-editor"></div>
@@ -471,6 +470,7 @@
       <div class="savebar" style="max-width:900px;">
         <button class="btn gold" id="params-save-btn">Enregistrer les paramètres</button>
         <span class="msg" id="params-status">Aucune modification en attente.</span>
+      </div>
       </div>
     </section>
 
@@ -525,14 +525,6 @@
     var dd = String(day).padStart(2,'0');
     var mm = String(meta.monthIndex+1).padStart(2,'0');
     return dd+"/"+mm+"/"+meta.year;
-  }
-  function isPastDay(label, day){
-    var meta = monthMeta(label);
-    var cellDate = new Date(meta.year, meta.monthIndex, day);
-    var today = new Date();
-    today.setHours(0,0,0,0);
-    cellDate.setHours(0,0,0,0);
-    return cellDate.getTime() < today.getTime();
   }
 
   function num(v){ v = parseFloat(v); return isNaN(v) ? 0 : v; }
@@ -646,15 +638,9 @@
   });
 
   /* ---------- Month selects (shared builder) ---------- */
-  function openMonths(){
-    var idx = (typeof STATE.moisOuvertIndex === 'number') ? STATE.moisOuvertIndex : MONTHS.length - 1;
-    idx = Math.max(0, Math.min(idx, MONTHS.length - 1));
-    return MONTHS.slice(0, idx + 1);
-  }
-
   function fillMonthSelect(sel, selected){
     sel.innerHTML = '';
-    openMonths().forEach(function(m){
+    MONTHS.forEach(function(m){
       var o = document.createElement('option');
       o.value = m; o.textContent = m;
       if(m===selected) o.selected = true;
@@ -703,24 +689,19 @@
       'Taux ' + current.activity + ' — Recette '+fmtPct(rr.recette)+'% · Paiement '+fmtPct(rr.paiement)+'% · LONACI '+fmtPct(rr.lonaci)+'% · Coupeur '+fmtPct(rr.coupeur)+'%';
     var tbody = document.getElementById('saisie-tbody');
     tbody.innerHTML = '';
-    var isAdmin = SESSION && SESSION.role === 'admin';
     draftDays.forEach(function(pair, idx){
-      var day = idx+1;
-      var locked = !isAdmin && isPastDay(current.saisieMonth, day);
       var tr = document.createElement('tr');
-      if(locked) tr.className = 'locked-row';
-      var dis = locked ? 'disabled title="Journée verrouillée — contactez votre concessionnaire pour une correction"' : '';
       tr.innerHTML =
-        '<td class="rowday">'+day+'</td>'+
-        '<td class="rowdate">'+fmtDate(current.saisieMonth, day)+(locked ? ' 🔒' : '')+'</td>'+
-        '<td class="num"><input class="cell-input" type="number" inputmode="decimal" data-i="'+idx+'" data-f="0" value="'+(pair[0]||'')+'" placeholder="0" '+dis+'></td>'+
-        '<td class="num"><input class="cell-input" type="number" inputmode="decimal" data-i="'+idx+'" data-f="1" value="'+(pair[1]||'')+'" placeholder="0" '+dis+'></td>';
+        '<td class="rowday">'+(idx+1)+'</td>'+
+        '<td class="rowdate">'+fmtDate(current.saisieMonth, idx+1)+'</td>'+
+        '<td class="num"><input class="cell-input" type="number" inputmode="decimal" data-i="'+idx+'" data-f="0" value="'+(pair[0]||'')+'" placeholder="0"></td>'+
+        '<td class="num"><input class="cell-input" type="number" inputmode="decimal" data-i="'+idx+'" data-f="1" value="'+(pair[1]||'')+'" placeholder="0"></td>';
       tbody.appendChild(tr);
     });
 
     tbody.addEventListener('input', function(e){
       var inp = e.target.closest('input.cell-input');
-      if(!inp || inp.disabled) return;
+      if(!inp) return;
       var i = parseInt(inp.getAttribute('data-i'),10);
       var f = parseInt(inp.getAttribute('data-f'),10);
       draftDays[i][f] = num(inp.value);
@@ -735,20 +716,14 @@
   function renderSaisieCards(){
     var t = computeTotals(draftDays, getActivityRates(current.activity));
     var cards = [
-      {k:'totalRecette', label:'Total recette', value: fmtFCFA(t.totalRecette), cls:''},
-      {k:'totalPaiement', label:'Total paiement', value: fmtFCFA(t.totalPaiement), cls:''},
-      {k:'montantTotal', label:'Montant total', value: fmtFCFA(t.montantTotal), cls:''},
-      {k:'montantLonaci', label:'Montant total LONACI', value: fmtFCFA(t.montantLonaci), cls:''},
-      {k:'pointPaiement', label:'Point paiement', value: fmtFCFA(t.pointPaiement), cls:'accent'},
-      {k:'salaireCoupeur', label:'Salaire coupeur', value: fmtFCFA(t.salaireCoupeur), cls:'accent'},
-      {k:'salaireMensuel', label:'Salaire mensuel', value: fmtFCFA(t.salaireMensuel), cls:'hero'}
+      {label:'Total recette', value: fmtFCFA(t.totalRecette), cls:''},
+      {label:'Total paiement', value: fmtFCFA(t.totalPaiement), cls:''},
+      {label:'Montant total', value: fmtFCFA(t.montantTotal), cls:''},
+      {label:'Montant total LONACI', value: fmtFCFA(t.montantLonaci), cls:''},
+      {label:'Point paiement', value: fmtFCFA(t.pointPaiement), cls:'accent'},
+      {label:'Salaire coupeur', value: fmtFCFA(t.salaireCoupeur), cls:'accent'},
+      {label:'Salaire mensuel', value: fmtFCFA(t.salaireMensuel), cls:'hero'}
     ];
-    var isAdmin = SESSION && SESSION.role === 'admin';
-    var allowedKeys = ['totalRecette', 'salaireCoupeur'];
-    if(!isAdmin){
-      cards = cards.filter(function(c){ return allowedKeys.indexOf(c.k) !== -1; });
-      cards.forEach(function(c){ if(c.k === 'salaireCoupeur') c.cls = 'hero'; });
-    }
     var wrap = document.getElementById('saisie-cards');
     wrap.innerHTML = '';
     cards.forEach(function(c){
@@ -815,29 +790,20 @@
   }
 
   /* ---------- SYNTHESE ---------- */
-  var FULL_COLS = [
-    {k:'totalRecette', label:'Total recette'},
-    {k:'totalPaiement', label:'Total paiement'},
-    {k:'montantTotal', label:'Montant total'},
-    {k:'montantLonaci', label:'Montant total LONACI'},
-    {k:'salaireCoupeur', label:'Salaire coupeur'},
-    {k:'pointPaiement', label:'Point paiement'},
-    {k:'salaireMensuel', label:'Salaire mensuel'}
-  ];
-  var SIMPLE_COLS = [
-    {k:'totalRecette', label:'Total recette'},
-    {k:'salaireCoupeur', label:'Salaire coupeur'}
-  ];
-  function visibleCols(){
-    return (SESSION && SESSION.role === 'admin') ? FULL_COLS : SIMPLE_COLS;
-  }
-
   function renderSynthese(){
     var monthSel = document.getElementById('synthese-month');
     fillMonthSelect(monthSel, current.syntheseMonth);
     monthSel.onchange = function(){ current.syntheseMonth = monthSel.value; renderSynthese(); };
 
-    var cols = visibleCols();
+    var cols = [
+      {k:'totalRecette', label:'Total recette'},
+      {k:'totalPaiement', label:'Total paiement'},
+      {k:'montantTotal', label:'Montant total'},
+      {k:'montantLonaci', label:'Montant total LONACI'},
+      {k:'salaireCoupeur', label:'Salaire coupeur'},
+      {k:'pointPaiement', label:'Point paiement'},
+      {k:'salaireMensuel', label:'Salaire mensuel'}
+    ];
     var html = '<thead><tr><th style="width:150px;">Activité</th>';
     cols.forEach(function(c){ html += '<th class="num">'+c.label+'</th>'; });
     html += '</tr></thead><tbody>';
@@ -857,13 +823,21 @@
 
   /* ---------- CONSOLIDATION ---------- */
   function renderConsolidation(){
-    var cols = visibleCols();
+    var cols = [
+      {k:'totalRecette', label:'Total recette'},
+      {k:'totalPaiement', label:'Total paiement'},
+      {k:'montantTotal', label:'Montant total'},
+      {k:'montantLonaci', label:'Montant total LONACI'},
+      {k:'salaireCoupeur', label:'Salaire coupeur'},
+      {k:'pointPaiement', label:'Point paiement'},
+      {k:'salaireMensuel', label:'Salaire mensuel'}
+    ];
     var html = '<thead><tr><th style="width:130px;">Mois</th>';
     cols.forEach(function(c){ html += '<th class="num">'+c.label+'</th>'; });
     html += '</tr></thead><tbody>';
 
     var totals = {}; cols.forEach(function(c){ totals[c.k]=0; });
-    openMonths().forEach(function(month){
+    MONTHS.forEach(function(month){
       var rowTotals = {}; cols.forEach(function(c){ rowTotals[c.k]=0; });
       STATE.activities.forEach(function(a){
         var t = activityTotalsForMonth(a, month);
@@ -877,81 +851,7 @@
     cols.forEach(function(c){ html += '<td class="num">'+fmtFCFA(totals[c.k])+'</td>'; });
     html += '</tr></tbody>';
     document.getElementById('consolidation-table').innerHTML = html;
-    updateCreateMonthUI();
   }
-
-  function updateCreateMonthUI(){
-    var wrap = document.getElementById('create-month-wrap');
-    var status = document.getElementById('create-month-status');
-    if(!wrap) return;
-    var idx = (typeof STATE.moisOuvertIndex === 'number') ? STATE.moisOuvertIndex : MONTHS.length - 1;
-    var isLast = idx >= MONTHS.length - 1;
-    var btn = document.getElementById('create-month-btn');
-    if(btn){
-      btn.disabled = isLast;
-      btn.textContent = isLast ? 'Tous les mois disponibles sont ouverts' : 'CRÉATION DU MOIS SUIVANT';
-    }
-    if(status){
-      status.textContent = isLast
-        ? ''
-        : 'Prochain mois à ouvrir : ' + MONTHS[idx+1];
-    }
-  }
-
-  document.getElementById('create-month-btn') && document.getElementById('create-month-btn').addEventListener('click', function(){
-    var idx = (typeof STATE.moisOuvertIndex === 'number') ? STATE.moisOuvertIndex : MONTHS.length - 1;
-    if(idx >= MONTHS.length - 1) return;
-    var nextMonth = MONTHS[idx+1];
-    if(!confirm('Créer le mois « ' + nextMonth + ' » et l\'ouvrir à la saisie pour toutes les activités ?')) return;
-    STATE.moisOuvertIndex = idx + 1;
-    persist('Mois « ' + nextMonth + ' » créé et ouvert à la saisie.', 'create-month-status');
-    updateCreateMonthUI();
-    showToast('Mois « ' + nextMonth + ' » créé.');
-  });
-
-  /* ---------- EXPORT (admin) ---------- */
-  function csvEscape(v){
-    v = String(v);
-    if(/[",;\n]/.test(v)) v = '"' + v.replace(/"/g,'""') + '"';
-    return v;
-  }
-
-  function tableToCSV(tableEl){
-    var rows = [];
-    tableEl.querySelectorAll('tr').forEach(function(tr){
-      var cells = [];
-      tr.querySelectorAll('th,td').forEach(function(cell){
-        cells.push(csvEscape(cell.textContent.trim()));
-      });
-      rows.push(cells.join(';'));
-    });
-    return rows.join('\r\n');
-  }
-
-  function downloadFile(filename, content, mime){
-    var blob = new Blob(['\uFEFF' + content], {type: mime + ';charset=utf-8;'});
-    var url = URL.createObjectURL(blob);
-    var a = document.createElement('a');
-    a.href = url; a.download = filename;
-    document.body.appendChild(a); a.click(); document.body.removeChild(a);
-    setTimeout(function(){ URL.revokeObjectURL(url); }, 1000);
-  }
-
-  var exportExcelBtn = document.getElementById('export-excel-btn');
-  if(exportExcelBtn) exportExcelBtn.addEventListener('click', function(){
-    var table = document.getElementById('consolidation-table');
-    var csv = tableToCSV(table);
-    var stamp = new Date().toISOString().slice(0,10);
-    downloadFile('LONALOTO_consolidation_' + stamp + '.csv', csv, 'text/csv');
-    showToast('Export Excel téléchargé.');
-  });
-
-  var exportPdfBtn = document.getElementById('export-pdf-btn');
-  if(exportPdfBtn) exportPdfBtn.addEventListener('click', function(){
-    document.body.classList.add('printing-consolidation');
-    window.print();
-    setTimeout(function(){ document.body.classList.remove('printing-consolidation'); }, 500);
-  });
 
   /* ---------- PARAMETRES ---------- */
   var draftActivities = []; // [{orig: string|null, value: string, rates:{recette,paiement,lonaci,coupeur}}]
@@ -968,6 +868,7 @@
     });
     renderActivitiesEditor();
     document.getElementById('params-status').textContent = 'Aucune modification en attente.';
+    if(paramsSub === 'comptes') loadAccounts();
   }
 
   function renderActivitiesEditor(){
@@ -1078,6 +979,212 @@
     persist('Paramètres enregistrés.', 'params-status');
   });
 
+  /* ---------- Paramètres : sous-menus ---------- */
+  var paramsSub = 'activites';
+  function showParamsSub(sub){
+    paramsSub = sub;
+    document.querySelectorAll('#params-subtabs button').forEach(function(b){
+      b.classList.toggle('active', b.getAttribute('data-sub') === sub);
+    });
+    document.getElementById('sub-activites').style.display = sub === 'activites' ? '' : 'none';
+    document.getElementById('sub-comptes').style.display = sub === 'comptes' ? '' : 'none';
+    if(sub === 'comptes') loadAccounts();
+  }
+  document.getElementById('params-subtabs').addEventListener('click', function(e){
+    var b = e.target.closest('button[data-sub]');
+    if(!b) return;
+    if(paramsSub === 'activites' && b.getAttribute('data-sub') !== 'activites' && dirty){
+      if(!confirm('Des paramètres ne sont pas enregistrés. Continuer sans enregistrer ?')) return;
+      dirty = false;
+      renderParametres();
+    }
+    showParamsSub(b.getAttribute('data-sub'));
+  });
+
+  /* ---------- GESTION DES COMPTES ---------- */
+  function accountsBanner(msg, kind){
+    var el = document.getElementById('accounts-banner');
+    el.className = 'acc-banner' + (msg ? ' ' + (kind || 'ok') : '');
+    el.textContent = msg || '';
+  }
+
+  async function accountsApi(url, options){
+    var res = await fetch(url, options);
+    var body = {};
+    try{ body = await res.json(); }catch(e){}
+    if(res.status === 401){
+      SESSION = null; showLoginForm(); showAuthGate();
+      throw new Error('Session expirée — reconnectez-vous.');
+    }
+    if(!res.ok) throw new Error(body.message || 'Une erreur est survenue.');
+    return body;
+  }
+
+  function pwLabel(acc, info){
+    if(acc.pwStatus === 'reset') return {cls:'temp', text:'Réinitialisé : ' + info.resetPassword + ' (à changer)'};
+    if(acc.pwStatus === 'initial') return {cls:'temp', text:'Par défaut : ' + info.defaultPassword + ' (à changer)'};
+    return {cls:'perso', text:'Personnalisé ••••••••'};
+  }
+
+  function roleLabel(acc){
+    if(acc.isSuper) return 'Super admin';
+    return acc.role === 'admin' ? 'Admin' : 'Agent';
+  }
+
+  async function loadAccounts(){
+    var table = document.getElementById('accounts-table');
+    table.innerHTML = '<tbody><tr><td>Chargement…</td></tr></tbody>';
+    try{
+      var info = await accountsApi('/api/accounts', {cache:'no-store'});
+      renderAccounts(info);
+    }catch(e){
+      table.innerHTML = '';
+      accountsBanner(e.message, 'err');
+    }
+  }
+
+  function renderAccounts(info){
+    var sup = info.viewerIsSuper;
+    document.getElementById('accounts-desc').textContent = sup
+      ? 'Vous êtes super admin : vous voyez tous les comptes, pouvez réinitialiser leurs mots de passe et changer leurs droits (agent ou admin).'
+      : 'Vous voyez les comptes que vous avez créés (les activités que vous avez ajoutées) et pouvez réinitialiser leurs mots de passe.';
+
+    var table = document.getElementById('accounts-table');
+    table.innerHTML = '';
+    var thead = document.createElement('thead');
+    var hr = document.createElement('tr');
+    ['Nom du compte', 'Rôle', 'Mot de passe', ''].concat(sup ? ['Créé par'] : []).forEach(function(h, i){
+      var th = document.createElement('th');
+      th.textContent = i === 3 ? 'Action' : h;
+      hr.appendChild(th);
+    });
+    thead.appendChild(hr);
+    table.appendChild(thead);
+
+    var tbody = document.createElement('tbody');
+    if(!info.accounts.length){
+      var tr0 = document.createElement('tr');
+      var td0 = document.createElement('td');
+      td0.colSpan = sup ? 5 : 4;
+      td0.textContent = "Aucun compte à afficher : vous n'avez encore créé aucun compte.";
+      tr0.appendChild(td0);
+      tbody.appendChild(tr0);
+    }
+
+    info.accounts.forEach(function(acc){
+      var tr = document.createElement('tr');
+
+      // Nom du compte
+      var tdName = document.createElement('td');
+      var nm = document.createElement('span');
+      nm.className = 'acc-name';
+      nm.textContent = acc.identifiant;
+      tdName.appendChild(nm);
+      var subTxt = [];
+      if(acc.id === info.viewerId) subTxt.push('vous');
+      if(acc.statut === 'bloque') subTxt.push('bloqué');
+      if(subTxt.length){
+        var sub = document.createElement('span');
+        sub.className = 'acc-sub';
+        sub.textContent = subTxt.join(' · ');
+        tdName.appendChild(sub);
+      }
+      tr.appendChild(tdName);
+
+      // Rôle
+      var tdRole = document.createElement('td');
+      if(acc.canChangeRole){
+        var sel = document.createElement('select');
+        sel.setAttribute('aria-label', 'Rôle de ' + acc.identifiant);
+        [['activite','Agent'],['admin','Admin']].forEach(function(o){
+          var op = document.createElement('option');
+          op.value = o[0]; op.textContent = o[1];
+          sel.appendChild(op);
+        });
+        sel.value = acc.role;
+        sel.addEventListener('change', function(){ changeRole(acc, sel); });
+        tdRole.appendChild(sel);
+      } else {
+        tdRole.textContent = roleLabel(acc);
+      }
+      tr.appendChild(tdRole);
+
+      // Mot de passe (état)
+      var tdPw = document.createElement('td');
+      var pl = pwLabel(acc, info);
+      var tag = document.createElement('span');
+      tag.className = 'pw-tag ' + pl.cls;
+      tag.textContent = pl.text;
+      tdPw.appendChild(tag);
+      tr.appendChild(tdPw);
+
+      // Bouton Réinitialiser
+      var tdAct = document.createElement('td');
+      if(acc.canReset){
+        var btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'btn gold';
+        btn.style.padding = '6px 12px';
+        btn.style.fontSize = '12px';
+        btn.textContent = 'Réinitialiser le mot de passe';
+        btn.addEventListener('click', function(){ resetPassword(acc, btn, info); });
+        tdAct.appendChild(btn);
+      } else {
+        tdAct.textContent = acc.id === info.viewerId ? '—' : (acc.isSuper ? 'Protégé' : '—');
+        tdAct.style.color = 'var(--ink-soft)';
+      }
+      tr.appendChild(tdAct);
+
+      if(sup){
+        var tdBy = document.createElement('td');
+        tdBy.textContent = acc.createdBy || '—';
+        tr.appendChild(tdBy);
+      }
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+  }
+
+  async function resetPassword(acc, btn, info){
+    if(!confirm('Êtes-vous sûr de vouloir réinitialiser le mot de passe de cet utilisateur (« ' + acc.identifiant + ' ») ?\n\nLe nouveau mot de passe sera ' + info.resetPassword + '. Le compte sera déconnecté et devra choisir un nouveau mot de passe à sa prochaine connexion.')) return;
+    btn.disabled = true;
+    accountsBanner('');
+    try{
+      var r = await accountsApi('/api/accounts/' + encodeURIComponent(acc.id) + '/reset-password', {method:'POST'});
+      var msg = r.message || 'Mot de passe réinitialisé avec succès';
+      await loadAccounts();
+      accountsBanner(msg + ' — « ' + acc.identifiant + ' » se connecte désormais avec ' + info.resetPassword + '.', 'ok');
+      showToast(msg);
+    }catch(e){
+      btn.disabled = false;
+      accountsBanner(e.message, 'err');
+    }
+  }
+
+  async function changeRole(acc, sel){
+    var next = sel.value;
+    var nextLabel = next === 'admin' ? 'Admin' : 'Agent';
+    var msg = 'Changer « ' + acc.identifiant + ' » en ' + nextLabel + ' ?';
+    if(next === 'admin') msg += '\n\nEn tant qu\'admin, ce compte verra toutes les activités et pourra modifier les paramètres. Il ne servira plus à la saisie de l\'activité « ' + acc.activiteNom + ' » seule.';
+    else msg += '\n\nCe compte ne verra plus que l\'activité « ' + acc.activiteNom + ' ». Les comptes qu\'il avait créés vous seront rattachés.';
+    msg += '\n\nIl sera déconnecté et devra se reconnecter.';
+    if(!confirm(msg)){ sel.value = acc.role; return; }
+    sel.disabled = true;
+    accountsBanner('');
+    try{
+      await accountsApi('/api/accounts/' + encodeURIComponent(acc.id) + '/role', {
+        method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({role: next})
+      });
+      await loadAccounts();
+      accountsBanner('Droits modifiés : « ' + acc.identifiant + ' » est maintenant ' + nextLabel + '.', 'ok');
+      showToast('Droits modifiés avec succès');
+    }catch(e){
+      sel.value = acc.role;
+      sel.disabled = false;
+      accountsBanner(e.message, 'err');
+    }
+  }
+
   /* ---------- Authentification ---------- */
   var SESSION = null; // {role, identifiant, activiteNom}
 
@@ -1101,7 +1208,7 @@
   function applyRoleToUI(){
     var badge = document.getElementById('user-badge');
     if(badge){
-      var label = SESSION.role === 'admin' ? 'Concessionnaire' : SESSION.activiteNom;
+      var label = SESSION.role !== 'admin' ? SESSION.activiteNom : (SESSION.isSuper ? 'Concessionnaire (super admin)' : 'Administrateur');
       badge.textContent = label + ' — ' + SESSION.identifiant;
     }
     document.querySelectorAll('[data-role="admin"]').forEach(function(el){
@@ -1126,7 +1233,7 @@
         errEl.style.display = 'block';
         return;
       }
-      SESSION = { role: body.role, identifiant: body.identifiant, activiteNom: body.activiteNom };
+      SESSION = { role: body.role, identifiant: body.identifiant, activiteNom: body.activiteNom, isSuper: !!body.isSuper };
       if(body.mustChangePassword){
         showChangePasswordForm();
       } else {
@@ -1192,7 +1299,7 @@
       var res = await fetch('/api/auth/me', {cache:'no-store'});
       if(res.ok){
         var body = await res.json();
-        SESSION = { role: body.role, identifiant: body.identifiant, activiteNom: body.activiteNom };
+        SESSION = { role: body.role, identifiant: body.identifiant, activiteNom: body.activiteNom, isSuper: !!body.isSuper };
         if(body.mustChangePassword){
           showAuthGate();
           showChangePasswordForm();
@@ -1215,24 +1322,6 @@
       STATE.activities.forEach(function(a){ STATE.activityRates[a] = Object.assign({}, baseRates); });
     }
     if(!STATE.defaultRates) STATE.defaultRates = Object.assign({}, DEFAULT_RATES);
-
-    // Migration : détermine le dernier mois "ouvert" à partir des données existantes,
-    // pour ne pas faire disparaître un mois déjà saisi lors du 1er chargement de cette version.
-    if(typeof STATE.moisOuvertIndex !== 'number'){
-      var lastFilled = -1;
-      MONTHS.forEach(function(month, idx){
-        var hasData = STATE.activities.some(function(a){
-          var t = computeTotals(getDays(a, month), getActivityRates(a));
-          return t.totalRecette !== 0 || t.totalPaiement !== 0;
-        });
-        if(hasData) lastFilled = idx;
-      });
-      if(lastFilled === -1){
-        var curIdx = MONTHS.indexOf(STATE.currentMonth);
-        lastFilled = curIdx >= 0 ? curIdx : 0;
-      }
-      STATE.moisOuvertIndex = lastFilled;
-    }
   }
 
   async function loadAppData(){
