@@ -41,6 +41,60 @@ const DEFAULT_PASSWORD = '123456789';   // mot de passe initial des nouveaux com
 const RESET_PASSWORD = '000000000';     // mot de passe après une réinitialisation par un admin (9 zéros)
 
 // ============================================================
+// Identifiant de connexion = nom du compte, normalisé
+// « Activité 3 » → « activite3 », « PIPI » → « pipi ». Sans majuscules, accents, espaces ni ponctuation :
+// l'utilisateur peut taper « PIPI », « Pipi » ou « pipi », c'est le même identifiant.
+// ============================================================
+function normalizeLogin(name) {
+  return String(name || '')
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, '');
+}
+
+// ============================================================
+// Verrou de minuit (comptes agents)
+// Fuseau de l'activité : Côte d'Ivoire (Africa/Abidjan, UTC+0). Une journée se verrouille
+// à minuit : à partir de là, un agent ne peut plus ni l'ajouter ni la modifier.
+// Les admins ne sont jamais concernés.
+// ============================================================
+const APP_TIMEZONE = process.env.APP_TIMEZONE || 'Africa/Abidjan';
+const MONTH_NAMES = ['JANVIER','FÉVRIER','MARS','AVRIL','MAI','JUIN','JUILLET','AOÛT','SEPTEMBRE','OCTOBRE','NOVEMBRE','DÉCEMBRE'];
+
+// Date du jour (AAAAMMJJ en nombre) dans le fuseau de l'activité.
+function todayKey() {
+  const parts = new Intl.DateTimeFormat('en-CA', { timeZone: APP_TIMEZONE, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
+  return Number(parts.replace(/-/g, ''));
+}
+// « OCTOBRE 2026 » + jour 5 → 20261005 (null si libellé inconnu).
+function dayKey(monthLabel, day) {
+  const m = /^(\S+)\s+(\d{4})$/.exec(String(monthLabel).trim());
+  if (!m) return null;
+  const mi = MONTH_NAMES.indexOf(m[1].toUpperCase());
+  if (mi === -1) return null;
+  return Number(m[2]) * 10000 + (mi + 1) * 100 + day;
+}
+
+// Pour un compte agent : toute journée passée reprend la valeur déjà enregistrée sur le serveur
+// (ou reste vide), quoi que contienne la requête. Les mois non envoyés sont conservés.
+function enforceMidnightLock(existingActivityData, incomingActivityData) {
+  const today = todayKey();
+  const result = Object.assign({}, existingActivityData || {});
+  for (const month of Object.keys(incomingActivityData || {})) {
+    const incomingDays = incomingActivityData[month];
+    if (!Array.isArray(incomingDays)) continue;
+    const existingDays = (existingActivityData && existingActivityData[month]) || [];
+    result[month] = incomingDays.map((pair, idx) => {
+      const k = dayKey(month, idx + 1);
+      const isPast = k === null || k < today; // libellé inconnu : verrouillé par prudence
+      if (isPast) return existingDays[idx] || [0, 0];
+      return pair;
+    });
+  }
+  return result;
+}
+
+// ============================================================
 // Schéma (phase 1 : authentification de base, sur l'état existant)
 // ============================================================
 async function ensureTables() {
@@ -105,12 +159,12 @@ async function ensureActivityAccounts(activityNames, creatorId, db) {
     if (existing.rows.length) continue;
     const r = await db.query(
       `INSERT INTO accounts (role, identifiant, password_hash, must_change_password, activite_nom, created_by, pw_status)
-       VALUES ('activite', $1, $2, true, $1, $3, 'initial')
+       VALUES ('activite', $4, $2, true, $1, $3, 'initial')
        ON CONFLICT (identifiant) DO NOTHING
        RETURNING id`,
-      [nom, hash, creator]
+      [nom, hash, creator, normalizeLogin(nom)]
     );
-    if (r.rows.length) console.log('Nouveau compte activité créé pour "' + nom + '" (mot de passe par défaut ' + DEFAULT_PASSWORD + ')');
+    if (r.rows.length) console.log('Nouveau compte activité créé pour "' + nom + '" (identifiant ' + normalizeLogin(nom) + ', mot de passe par défaut ' + DEFAULT_PASSWORD + ')');
     else console.warn('Activité "' + nom + '" : l\'identifiant existe déjà pour un autre compte, aucun compte créé.');
   }
 }
@@ -136,13 +190,15 @@ async function syncAccountStatuses(activityNames, db) {
 
 // Renomme le compte rattaché à une activité renommée (même mot de passe, même historique).
 // Lève une erreur « rename_conflict » si le nouveau nom est déjà pris par un vrai compte.
-async function renameActivityAccount(from, to, db) {
+async function renameActivityAccount(from, to, db, actorId) {
   const acc = await db.query('SELECT id, identifiant FROM accounts WHERE activite_nom = $1 LIMIT 1', [from]);
-  if (!acc.rows.length) return; // pas de compte : il sera créé normalement
+  if (!acc.rows.length) return null; // pas de compte : il sera créé normalement
   const accountId = acc.rows[0].id;
+  const newLogin = normalizeLogin(to);
+  if (!newLogin) { const err = new Error('rename_conflict'); err.conflictName = to; throw err; }
   const clash = await db.query(
-    'SELECT id, role, is_super, pw_status, activite_nom FROM accounts WHERE (identifiant = $1 OR activite_nom = $1) AND id <> $2',
-    [to, accountId]);
+    'SELECT id, role, is_super, pw_status, activite_nom FROM accounts WHERE (identifiant = $1 OR activite_nom = $2) AND id <> $3',
+    [newLogin, to, accountId]);
   for (const c of clash.rows) {
     // Un compte « fantôme » jamais utilisé (créé automatiquement pour ce nom) peut être supprimé sans risque.
     if (c.role === 'activite' && !c.is_super && c.pw_status === 'initial' && c.activite_nom === to) {
@@ -154,9 +210,27 @@ async function renameActivityAccount(from, to, db) {
     }
   }
   await db.query(
-    'UPDATE accounts SET identifiant = $1, activite_nom = $1, updated_at = now() WHERE id = $2',
-    [to, accountId]);
-  console.log('Compte « ' + acc.rows[0].identifiant + ' » renommé en « ' + to + ' » (activité renommée).');
+    'UPDATE accounts SET identifiant = $1, activite_nom = $2, updated_at = now() WHERE id = $3',
+    [newLogin, to, accountId]);
+  // L'identifiant a changé : ses sessions ouvertes sont fermées, il se reconnecte avec le nouvel identifiant
+  // (même mot de passe). L'admin qui fait le changement reste connecté.
+  if (accountId !== actorId) await db.query('DELETE FROM sessions WHERE account_id = $1', [accountId]);
+  console.log('Compte « ' + acc.rows[0].identifiant + ' » renommé : activité « ' + to + ' », identifiant « ' + newLogin + ' ».');
+  return { activite: to, identifiant: newLogin, ancien: acc.rows[0].identifiant };
+}
+
+// Met les identifiants existants au format normalisé (une seule fois, sans effet ensuite).
+async function normalizeExistingLogins() {
+  const r = await pool.query('SELECT id, identifiant, activite_nom FROM accounts');
+  const taken = new Set(r.rows.map((a) => a.identifiant));
+  for (const a of r.rows) {
+    const target = normalizeLogin(a.activite_nom || a.identifiant);
+    if (!target || target === a.identifiant) continue;
+    if (taken.has(target)) { console.warn('Identifiant « ' + a.identifiant + ' » non normalisé : « ' + target + ' » est déjà pris.'); continue; }
+    await pool.query('UPDATE accounts SET identifiant = $1, updated_at = now() WHERE id = $2', [target, a.id]);
+    taken.delete(a.identifiant); taken.add(target);
+    console.log('Identifiant « ' + a.identifiant + ' » → « ' + target + ' »');
+  }
 }
 
 // Réparation ponctuelle : l'activité ANGE a été renommée PIPI avant que le serveur sache suivre les renommages.
@@ -167,7 +241,7 @@ async function repairAngePipi(activities) {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const ange = await client.query(`SELECT id FROM accounts WHERE identifiant = 'ANGE' AND activite_nom = 'ANGE' AND is_super = false`);
+    const ange = await client.query(`SELECT id FROM accounts WHERE activite_nom = 'ANGE' AND is_super = false`);
     if (ange.rows.length) {
       await renameActivityAccount('ANGE', 'PIPI', client);
       await client.query(`UPDATE accounts SET statut = 'actif' WHERE id = $1`, [ange.rows[0].id]);
@@ -203,6 +277,7 @@ async function seedAccountsIfEmpty() {
   const stateRes = await pool.query('SELECT data FROM app_state WHERE id = 1');
   const activities = (stateRes.rows[0] && stateRes.rows[0].data && stateRes.rows[0].data.activities) || [];
   await repairAngePipi(activities);
+  await normalizeExistingLogins();
   await ensureActivityAccounts(activities);
   await syncAccountStatuses(activities);
 }
@@ -333,14 +408,18 @@ app.post('/api/auth/login', async (req, res) => {
   const { identifiant, password } = req.body || {};
   if (!identifiant || !password) return res.status(400).json({ error: 'missing_fields' });
 
-  const keys = ['ip:' + req.ip, 'id:' + String(identifiant).toLowerCase()];
+  const login = normalizeLogin(identifiant);
+  const keys = ['ip:' + req.ip, 'id:' + login];
   const wait = loginLockedFor(keys);
   if (wait) {
     return res.status(429).json({ error: 'too_many_attempts', message: 'Trop de tentatives. Réessayez dans ' + wait + ' minute(s).' });
   }
 
   try {
-    const r = await pool.query('SELECT * FROM accounts WHERE identifiant = $1', [identifiant]);
+    // Identifiant normalisé (« PIPI » = « pipi ») ; l'identifiant exact reste accepté par sécurité.
+    const r = await pool.query(
+      'SELECT * FROM accounts WHERE identifiant = $1 OR identifiant = $2 ORDER BY (identifiant = $1) DESC LIMIT 1',
+      [login, String(identifiant).trim()]);
     if (r.rows.length === 0) { loginRecordFail(keys); return res.status(401).json({ error: 'invalid_credentials' }); }
     const account = r.rows[0];
 
@@ -471,12 +550,17 @@ app.put('/api/state', requireAuth, async (req, res) => {
         const prevActs = (prevRes.rows[0] && prevRes.rows[0].data && prevRes.rows[0].data.activities) || [];
         const renames = renamesRaw.filter((r) => r && typeof r.from === 'string' && typeof r.to === 'string'
           && r.from !== r.to && prevActs.includes(r.from) && newActs.includes(r.to) && !newActs.includes(r.from));
-        for (const r of renames) await renameActivityAccount(r.from, r.to, client);
+        const renamedAccounts = [];
+        for (const r of renames) {
+          const done = await renameActivityAccount(r.from, r.to, client, req.account.accountId);
+          if (done) renamedAccounts.push(done);
+        }
         // Nouvelle activité dont le nom est déjà l'identifiant d'un autre compte (ex. « admin ») : refusé.
         const renamedTo = renames.map((r) => r.to);
         for (const nom of newActs.filter((n) => !prevActs.includes(n) && !renamedTo.includes(n))) {
+          if (!normalizeLogin(nom)) { const err = new Error('rename_conflict'); err.conflictName = nom; throw err; }
           const clash = await client.query(
-            'SELECT 1 FROM accounts WHERE identifiant = $1 AND activite_nom IS DISTINCT FROM $1', [nom]);
+            'SELECT 1 FROM accounts WHERE identifiant = $1 AND activite_nom IS DISTINCT FROM $2', [normalizeLogin(nom), nom]);
           if (clash.rows.length) { const err = new Error('rename_conflict'); err.conflictName = nom; throw err; }
         }
 
@@ -490,16 +574,17 @@ app.put('/api/state', requireAuth, async (req, res) => {
         await syncAccountStatuses(newActs, client);
         await client.query('COMMIT');
         res.setHeader('X-State-Version', saved.rows[0].v);
+        req.renamedAccounts = renamedAccounts;
       } catch (e) {
         await client.query('ROLLBACK').catch(() => {});
         if (e.message === 'rename_conflict') {
-          return res.status(409).json({ error: 'rename_conflict', message: 'Le nom « ' + e.conflictName + ' » est déjà utilisé par un autre compte. Rien n\'a été enregistré.' });
+          return res.status(409).json({ error: 'rename_conflict', message: 'Le nom « ' + e.conflictName + ' » ne peut pas être utilisé : il correspond déjà à l\'identifiant d\'un autre compte (ou ne contient aucune lettre ni chiffre). Rien n\'a été enregistré.' });
         }
         throw e;
       } finally {
         client.release();
       }
-      return res.json({ ok: true });
+      return res.json({ ok: true, renamed: req.renamedAccounts || [] });
     }
 
     // Un compte activité ne peut écrire QUE dans sa propre section de données,
@@ -515,6 +600,10 @@ app.put('/api/state', requireAuth, async (req, res) => {
     const ownIncoming = incoming.data && incoming.data[nom];
     if (!ownIncoming) return res.status(400).json({ error: 'invalid_body' });
 
+    // Verrou de minuit : un agent ne peut ni ajouter ni modifier une journée déjà passée.
+    const existingOwn = (full.data && full.data[nom]) || {};
+    const lockedOwn = enforceMidnightLock(existingOwn, ownIncoming);
+
     // Mise à jour atomique de la seule section de l'agent : deux agents qui enregistrent en même temps
     // ne peuvent plus s'écraser l'un l'autre.
     await pool.query(
@@ -522,7 +611,7 @@ app.put('/api/state', requireAuth, async (req, res) => {
           SET data = jsonb_set(jsonb_set(data, '{data}', COALESCE(data->'data', '{}'::jsonb)), ARRAY['data', $1::text], $2::jsonb),
               updated_at = clock_timestamp()
         WHERE id = 1`,
-      [nom, JSON.stringify(ownIncoming)]
+      [nom, JSON.stringify(lockedOwn)]
     );
     res.json({ ok: true });
   } catch (e) {
