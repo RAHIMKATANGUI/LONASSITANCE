@@ -92,15 +92,18 @@ async function getSuperAdminId() {
   return r.rows.length ? r.rows[0].id : null;
 }
 
-// Garantit qu'un compte activité existe pour chaque nom d'activité de la liste donnée.
-// Idempotent (ON CONFLICT DO NOTHING) — peut être rappelée à chaque sauvegarde admin.
+// Garantit qu'un compte existe pour chaque activité de la liste, et un seul.
+// Un compte déjà rattaché à l'activité (même sous un autre identifiant) est réutilisé : jamais de doublon.
 // creatorId : le compte admin qui a ajouté l'activité (il pourra ensuite réinitialiser son mot de passe).
-async function ensureActivityAccounts(activityNames, creatorId) {
+async function ensureActivityAccounts(activityNames, creatorId, db) {
+  db = db || pool;
   if (!activityNames || !activityNames.length) return;
   const hash = await bcrypt.hash(DEFAULT_PASSWORD, 10);
   const creator = creatorId || await getSuperAdminId();
   for (const nom of activityNames) {
-    const r = await pool.query(
+    const existing = await db.query('SELECT id FROM accounts WHERE activite_nom = $1 LIMIT 1', [nom]);
+    if (existing.rows.length) continue;
+    const r = await db.query(
       `INSERT INTO accounts (role, identifiant, password_hash, must_change_password, activite_nom, created_by, pw_status)
        VALUES ('activite', $1, $2, true, $1, $3, 'initial')
        ON CONFLICT (identifiant) DO NOTHING
@@ -108,6 +111,74 @@ async function ensureActivityAccounts(activityNames, creatorId) {
       [nom, hash, creator]
     );
     if (r.rows.length) console.log('Nouveau compte activité créé pour "' + nom + '" (mot de passe par défaut ' + DEFAULT_PASSWORD + ')');
+    else console.warn('Activité "' + nom + '" : l\'identifiant existe déjà pour un autre compte, aucun compte créé.');
+  }
+}
+
+// Aligne les comptes sur la liste des activités :
+//  - agent dont l'activité a été retirée  → bloqué (et déconnecté) ;
+//  - agent dont l'activité est de nouveau dans la liste → réactivé.
+async function syncAccountStatuses(activityNames, db) {
+  db = db || pool;
+  const list = activityNames || [];
+  const blocked = await db.query(
+    `UPDATE accounts SET statut = 'bloque', updated_at = now()
+      WHERE role = 'activite' AND statut = 'actif' AND activite_nom IS NOT NULL AND NOT (activite_nom = ANY($1::text[]))
+      RETURNING id, identifiant`, [list]);
+  for (const a of blocked.rows) {
+    await db.query('DELETE FROM sessions WHERE account_id = $1', [a.id]);
+    console.log('Compte « ' + a.identifiant + ' » bloqué : son activité a été retirée de la liste.');
+  }
+  await db.query(
+    `UPDATE accounts SET statut = 'actif', updated_at = now()
+      WHERE role = 'activite' AND statut = 'bloque' AND activite_nom = ANY($1::text[])`, [list]);
+}
+
+// Renomme le compte rattaché à une activité renommée (même mot de passe, même historique).
+// Lève une erreur « rename_conflict » si le nouveau nom est déjà pris par un vrai compte.
+async function renameActivityAccount(from, to, db) {
+  const acc = await db.query('SELECT id, identifiant FROM accounts WHERE activite_nom = $1 LIMIT 1', [from]);
+  if (!acc.rows.length) return; // pas de compte : il sera créé normalement
+  const accountId = acc.rows[0].id;
+  const clash = await db.query(
+    'SELECT id, role, is_super, pw_status, activite_nom FROM accounts WHERE (identifiant = $1 OR activite_nom = $1) AND id <> $2',
+    [to, accountId]);
+  for (const c of clash.rows) {
+    // Un compte « fantôme » jamais utilisé (créé automatiquement pour ce nom) peut être supprimé sans risque.
+    if (c.role === 'activite' && !c.is_super && c.pw_status === 'initial' && c.activite_nom === to) {
+      await db.query('DELETE FROM accounts WHERE id = $1', [c.id]);
+    } else {
+      const err = new Error('rename_conflict');
+      err.conflictName = to;
+      throw err;
+    }
+  }
+  await db.query(
+    'UPDATE accounts SET identifiant = $1, activite_nom = $1, updated_at = now() WHERE id = $2',
+    [to, accountId]);
+  console.log('Compte « ' + acc.rows[0].identifiant + ' » renommé en « ' + to + ' » (activité renommée).');
+}
+
+// Réparation ponctuelle : l'activité ANGE a été renommée PIPI avant que le serveur sache suivre les renommages.
+// Résultat : un compte PIPI en double (jamais utilisé) et l'ancien compte ANGE orphelin.
+// On supprime le doublon et on renomme ANGE → PIPI (l'agent garde son mot de passe). Sans effet une fois fait.
+async function repairAngePipi(activities) {
+  if (!activities.includes('PIPI') || activities.includes('ANGE')) return;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const ange = await client.query(`SELECT id FROM accounts WHERE identifiant = 'ANGE' AND activite_nom = 'ANGE' AND is_super = false`);
+    if (ange.rows.length) {
+      await renameActivityAccount('ANGE', 'PIPI', client);
+      await client.query(`UPDATE accounts SET statut = 'actif' WHERE id = $1`, [ange.rows[0].id]);
+      console.log('Réparation : compte ANGE fusionné dans PIPI.');
+    }
+    await client.query('COMMIT');
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('Réparation ANGE → PIPI impossible :', e.message);
+  } finally {
+    client.release();
   }
 }
 
@@ -131,7 +202,9 @@ async function seedAccountsIfEmpty() {
   }
   const stateRes = await pool.query('SELECT data FROM app_state WHERE id = 1');
   const activities = (stateRes.rows[0] && stateRes.rows[0].data && stateRes.rows[0].data.activities) || [];
+  await repairAngePipi(activities);
   await ensureActivityAccounts(activities);
+  await syncAccountStatuses(activities);
 }
 
 // ============================================================
@@ -361,8 +434,12 @@ function scopeStateForAccount(fullState, account) {
 
 app.get('/api/state', requireAuth, async (req, res) => {
   try {
-    const r = await pool.query('SELECT data FROM app_state WHERE id = 1');
+    const r = await pool.query('SELECT data, updated_at::text AS v FROM app_state WHERE id = 1');
     const full = r.rows.length ? r.rows[0].data : null;
+    // Version de l'état : renvoyée à chaque enregistrement admin pour détecter qu'un autre utilisateur
+    // a enregistré entre-temps (sinon l'admin écraserait sans le savoir les saisies des agents).
+    if (r.rows.length) res.setHeader('X-State-Version', r.rows[0].v);
+    res.setHeader('Cache-Control', 'no-store');
     res.json(scopeStateForAccount(full, req.account));
   } catch (e) {
     console.error('GET /api/state error:', e.message);
@@ -377,13 +454,51 @@ app.put('/api/state', requireAuth, async (req, res) => {
   }
   try {
     if (req.account.role === 'admin') {
-      // L'admin peut tout modifier (activités, taux, données) — comportement inchangé.
-      await pool.query(
-        `INSERT INTO app_state (id, data, updated_at) VALUES (1, $1, now())
-         ON CONFLICT (id) DO UPDATE SET data = $1, updated_at = now()`,
-        [incoming]
-      );
-      ensureActivityAccounts(incoming.activities, req.account.accountId).catch((e) => console.error('ensureActivityAccounts error:', e.message));
+      // L'admin peut tout modifier (activités, taux, données).
+      // « _renames » (envoyé par la page Paramètres) n'est pas stocké : il sert à renommer les comptes liés.
+      const renamesRaw = Array.isArray(incoming._renames) ? incoming._renames : [];
+      delete incoming._renames;
+      const newActs = Array.isArray(incoming.activities) ? incoming.activities : [];
+
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const prevRes = await client.query('SELECT data, updated_at::text AS v FROM app_state WHERE id = 1 FOR UPDATE');
+        if (prevRes.rows.length && req.get('X-State-Version') !== prevRes.rows[0].v) {
+          await client.query('ROLLBACK');
+          return res.status(409).json({ error: 'state_conflict', message: 'Les données ont été modifiées par un autre utilisateur depuis l\'ouverture de la page.' });
+        }
+        const prevActs = (prevRes.rows[0] && prevRes.rows[0].data && prevRes.rows[0].data.activities) || [];
+        const renames = renamesRaw.filter((r) => r && typeof r.from === 'string' && typeof r.to === 'string'
+          && r.from !== r.to && prevActs.includes(r.from) && newActs.includes(r.to) && !newActs.includes(r.from));
+        for (const r of renames) await renameActivityAccount(r.from, r.to, client);
+        // Nouvelle activité dont le nom est déjà l'identifiant d'un autre compte (ex. « admin ») : refusé.
+        const renamedTo = renames.map((r) => r.to);
+        for (const nom of newActs.filter((n) => !prevActs.includes(n) && !renamedTo.includes(n))) {
+          const clash = await client.query(
+            'SELECT 1 FROM accounts WHERE identifiant = $1 AND activite_nom IS DISTINCT FROM $1', [nom]);
+          if (clash.rows.length) { const err = new Error('rename_conflict'); err.conflictName = nom; throw err; }
+        }
+
+        const saved = await client.query(
+          `INSERT INTO app_state (id, data, updated_at) VALUES (1, $1, clock_timestamp())
+           ON CONFLICT (id) DO UPDATE SET data = $1, updated_at = clock_timestamp()
+           RETURNING updated_at::text AS v`,
+          [incoming]
+        );
+        await ensureActivityAccounts(newActs, req.account.accountId, client);
+        await syncAccountStatuses(newActs, client);
+        await client.query('COMMIT');
+        res.setHeader('X-State-Version', saved.rows[0].v);
+      } catch (e) {
+        await client.query('ROLLBACK').catch(() => {});
+        if (e.message === 'rename_conflict') {
+          return res.status(409).json({ error: 'rename_conflict', message: 'Le nom « ' + e.conflictName + ' » est déjà utilisé par un autre compte. Rien n\'a été enregistré.' });
+        }
+        throw e;
+      } finally {
+        client.release();
+      }
       return res.json({ ok: true });
     }
 
@@ -394,16 +509,20 @@ app.put('/api/state', requireAuth, async (req, res) => {
     if (r.rows.length === 0) return res.status(409).json({ error: 'state_not_initialized' });
 
     const full = r.rows[0].data;
+    if (!Array.isArray(full.activities) || !full.activities.includes(nom)) {
+      return res.status(403).json({ error: 'activity_removed', message: 'Votre activité n\'existe plus. Contactez votre concessionnaire.' });
+    }
     const ownIncoming = incoming.data && incoming.data[nom];
     if (!ownIncoming) return res.status(400).json({ error: 'invalid_body' });
 
-    full.data = full.data || {};
-    full.data[nom] = ownIncoming;
-
+    // Mise à jour atomique de la seule section de l'agent : deux agents qui enregistrent en même temps
+    // ne peuvent plus s'écraser l'un l'autre.
     await pool.query(
-      `INSERT INTO app_state (id, data, updated_at) VALUES (1, $1, now())
-       ON CONFLICT (id) DO UPDATE SET data = $1, updated_at = now()`,
-      [full]
+      `UPDATE app_state
+          SET data = jsonb_set(jsonb_set(data, '{data}', COALESCE(data->'data', '{}'::jsonb)), ARRAY['data', $1::text], $2::jsonb),
+              updated_at = clock_timestamp()
+        WHERE id = 1`,
+      [nom, JSON.stringify(ownIncoming)]
     );
     res.json({ ok: true });
   } catch (e) {
