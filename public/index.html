@@ -583,33 +583,101 @@
     setTimeout(function(){ t.classList.remove('show'); }, 2600);
   }
 
-  async function persist(successMsg, statusId){
-    try{
-      var res = await fetch('/api/state', {
-        method: 'PUT',
-        headers: {'Content-Type':'application/json'},
-        body: JSON.stringify(STATE)
+  // Version de l'état lue sur le serveur + copie de ce qui a été chargé (pour fusionner en cas de conflit).
+  var STATE_VERSION = null, BASE_STATE = null, PENDING_RENAMES = [];
+  function deepCopy(o){ return o == null ? o : JSON.parse(JSON.stringify(o)); }
+
+  // Fusion à trois voies : on garde MES modifications (mine ≠ base) et, partout ailleurs,
+  // ce que les autres ont enregistré entre-temps (theirs). Case par case pour les saisies.
+  function mergeStates(base, mine, theirs){
+    if(!base || !theirs) return mine;
+    var out = deepCopy(mine);
+    Object.keys(theirs).forEach(function(k){
+      if(k === 'data') return;
+      if(JSON.stringify(mine[k]) === JSON.stringify(base[k])) out[k] = deepCopy(theirs[k]);
+    });
+    out.data = out.data || {};
+    var td = theirs.data || {}, bd = base.data || {};
+    var renameTo = {};
+    PENDING_RENAMES.forEach(function(r){ renameTo[r.from] = r.to; });
+    Object.keys(td).forEach(function(act){
+      var target = renameTo[act] || act;
+      if(!out.data[target]){ out.data[target] = deepCopy(td[act]); return; }
+      var baseAct = bd[act] || {};
+      Object.keys(td[act]).forEach(function(month){
+        var tm = td[act][month] || [], bm = baseAct[month] || [];
+        if(!out.data[target][month]){ out.data[target][month] = deepCopy(tm); return; }
+        var om = out.data[target][month];
+        for(var i=0;i<tm.length;i++){
+          if(!om[i]) om[i] = [0,0];
+          for(var f=0; f<2; f++){
+            var bv = bm[i] ? num(bm[i][f]) : 0;
+            if(num(om[i][f]) === bv) om[i][f] = tm[i] ? tm[i][f] : 0;
+          }
+        }
       });
-      if(res.status === 401){
-        SESSION = null;
-        showLoginForm();
-        showAuthGate();
-        return;
-      }
-      if(res.ok){
-        dirty = false;
-        var el = document.getElementById(statusId);
-        if(el){ el.textContent = successMsg; }
-        showToast('Modifications enregistrées.');
-        try{ localStorage.setItem('lonaloto_backup', JSON.stringify(STATE)); }catch(e){}
-        return;
-      }
-    }catch(e){ /* fall through to local-only save */ }
-    try{ localStorage.setItem('lonaloto_backup', JSON.stringify(STATE)); }catch(e){}
-    dirty = false;
-    var el2 = document.getElementById(statusId);
-    if(el2){ el2.textContent = 'Connexion au serveur indisponible — enregistré localement dans ce navigateur seulement.'; }
-    showToast('Enregistré localement (hors ligne).');
+    });
+    return out;
+  }
+
+  async function persist(successMsg, statusId, isRetry){
+    var el = document.getElementById(statusId);
+    var payload = deepCopy(STATE);
+    if(SESSION && SESSION.role === 'admin' && PENDING_RENAMES.length) payload._renames = PENDING_RENAMES;
+    var res;
+    try{
+      res = await fetch('/api/state', {
+        method: 'PUT',
+        headers: {'Content-Type':'application/json', 'X-State-Version': STATE_VERSION || ''},
+        body: JSON.stringify(payload)
+      });
+    }catch(e){
+      // Vraie coupure réseau : sauvegarde locale de secours.
+      try{ localStorage.setItem('lonaloto_backup', JSON.stringify(STATE)); }catch(e2){}
+      if(el){ el.textContent = 'Connexion au serveur indisponible — rien n\'a été envoyé. Réessayez « Enregistrer » dès que la connexion revient.'; }
+      showToast('Non enregistré : serveur injoignable.');
+      return;
+    }
+    if(res.status === 401){
+      SESSION = null;
+      showLoginForm();
+      showAuthGate();
+      return;
+    }
+    if(res.ok){
+      STATE_VERSION = res.headers.get('X-State-Version') || STATE_VERSION;
+      BASE_STATE = deepCopy(STATE);
+      PENDING_RENAMES = [];
+      dirty = false;
+      if(el){ el.textContent = successMsg; }
+      showToast('Modifications enregistrées.');
+      try{ localStorage.setItem('lonaloto_backup', JSON.stringify(STATE)); }catch(e){}
+      return;
+    }
+    var err = await res.json().catch(function(){ return {}; });
+    if(res.status === 409 && err.error === 'state_conflict' && !isRetry){
+      // Quelqu'un a enregistré entre-temps : on récupère ses données, on y ajoute les miennes, et on réessaie.
+      try{
+        var fr = await fetch('/api/state', {cache:'no-store'});
+        if(fr.ok){
+          var theirs = await fr.json();
+          STATE = mergeStates(BASE_STATE, STATE, theirs);
+          BASE_STATE = deepCopy(theirs);
+          STATE_VERSION = fr.headers.get('X-State-Version');
+          if(current && current.view) setView(current.view);
+          return persist(successMsg, statusId, true);
+        }
+      }catch(e){}
+    }
+    var msg = err.message || ('Erreur ' + res.status);
+    if(el){ el.textContent = 'Non enregistré : ' + msg; }
+    showToast('Non enregistré : ' + msg);
+    if(err.error === 'rename_conflict'){
+      alert(msg);
+      PENDING_RENAMES = [];
+      dirty = false;
+      await loadAppData(); // on revient à l'état du serveur
+    }
   }
 
   /* ---------- Rendering: tab nav ---------- */
@@ -898,7 +966,7 @@
       del.disabled = draftActivities.length <= 1;
       del.addEventListener('click', function(){
         if(draftActivities.length <= 1) return;
-        if(!confirm('Retirer « '+ (item.value || item.orig) +' » de la liste ? Les données déjà saisies pour cette activité seront conservées mais ne seront plus affichées.')) return;
+        if(!confirm('Retirer « '+ (item.value || item.orig) +' » de la liste ? Les données déjà saisies pour cette activité seront conservées mais ne seront plus affichées, et son compte sera bloqué (il sera réactivé si vous recréez l\'activité sous le même nom).')) return;
         draftActivities.splice(idx,1);
         markDirty('Modifications non enregistrées.', 'params-status');
         renderActivitiesEditor();
@@ -958,10 +1026,24 @@
       seen[v] = true;
     }
 
-    var newData = {};
+    // Un nouveau nom ne peut pas reprendre le nom d'une activité que l'on est en train de renommer.
+    var renamedFrom = {};
+    cleaned.forEach(function(item){ if(item.orig && item.orig !== item.value) renamedFrom[item.orig] = item.value; });
+    for(var j=0;j<cleaned.length;j++){
+      if(renamedFrom[cleaned[j].value] && cleaned[j].orig !== cleaned[j].value){
+        alert('« '+cleaned[j].value+' » est en cours de renommage en « '+renamedFrom[cleaned[j].value]+' ». Choisissez un autre nom.');
+        return;
+      }
+    }
+
+    // Les données des activités retirées sont CONSERVÉES (masquées) ; seules les activités renommées changent de clé.
+    var newData = Object.assign({}, STATE.data);
+    Object.keys(renamedFrom).forEach(function(o){ delete newData[o]; });
     var newActivityRates = {};
+    PENDING_RENAMES = [];
     cleaned.forEach(function(item){
       var sourceKey = item.orig || item.value;
+      if(item.orig && item.orig !== item.value) PENDING_RENAMES.push({from: item.orig, to: item.value});
       newData[item.value] = STATE.data[sourceKey] || STATE.data[item.value] || {};
       newActivityRates[item.value] = {
         recette: num(item.rates.recette),
@@ -1337,13 +1419,17 @@
       }
       if(res.ok){
         var remote = await res.json();
+        STATE_VERSION = res.headers.get('X-State-Version');
         if(remote){
           STATE = remote;
+          BASE_STATE = deepCopy(remote);
         } else if(SESSION.role === 'admin') {
           // Base de données vide (premier déploiement) : on l'initialise avec les données embarquées.
-          await fetch('/api/state', {
+          var init = await fetch('/api/state', {
             method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(STATE)
           });
+          STATE_VERSION = init.headers.get('X-State-Version');
+          BASE_STATE = deepCopy(STATE);
         }
       } else {
         throw new Error('api_unavailable');
@@ -1352,7 +1438,7 @@
       if(banner) banner.style.display = 'block';
       try{
         var backup = localStorage.getItem('lonaloto_backup');
-        if(backup) STATE = JSON.parse(backup);
+        if(backup){ STATE = JSON.parse(backup); BASE_STATE = deepCopy(STATE); STATE_VERSION = null; }
       }catch(e2){}
     }
     runMigrations();
