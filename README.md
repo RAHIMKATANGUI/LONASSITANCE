@@ -66,3 +66,16 @@ DATABASE_URL=postgres://user:password@localhost:5432/lonaloto npm start
 ```
 
 L'application est alors accessible sur `http://localhost:3000`.
+
+## Gestion des comptes (Paramètres → GESTION DES COMPTES)
+
+- Le compte **admin** d'origine (le concessionnaire) est le **super admin**. Il voit tous les comptes,
+  réinitialise n'importe quel mot de passe (sauf le sien) et change les droits d'un compte d'activité
+  (Agent ⇄ Admin).
+- Un **admin** voit uniquement les comptes qu'il a créés (les activités qu'il a ajoutées dans Paramètres)
+  et peut réinitialiser leurs mots de passe.
+- **Réinitialiser** remet le mot de passe à `000000000`, déconnecte le compte, et l'oblige à choisir un
+  nouveau mot de passe à sa prochaine connexion.
+- Les mots de passe sont stockés chiffrés (bcrypt) : la colonne « Mot de passe » affiche leur **état**
+  (par défaut / réinitialisé / personnalisé), jamais le mot de passe lui-même.
+- Toutes ces règles sont vérifiées par le serveur. La mise à jour de la base est automatique au démarrage.

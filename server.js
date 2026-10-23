@@ -10,7 +10,20 @@ const cookieParser = require('cookie-parser');
 const { Pool } = require('pg');
 
 const app = express();
+app.disable('x-powered-by');
+app.set('trust proxy', 1); // Render passe par un proxy : nécessaire pour connaître la vraie IP du client
 app.use(express.json({ limit: '5mb' }));
+
+// En-têtes de sécurité de base (sans dépendance supplémentaire)
+app.use((req, res, next) => {
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'same-origin');
+  if (process.env.RENDER || process.env.NODE_ENV === 'production') {
+    res.setHeader('Strict-Transport-Security', 'max-age=31536000');
+  }
+  next();
+});
 app.use(cookieParser());
 
 if (!process.env.DATABASE_URL) {
@@ -24,40 +37,8 @@ const pool = new Pool({
 
 const SESSION_COOKIE = 'lonaloto_session';
 const SESSION_DURATION_MS = 2 * 60 * 60 * 1000; // 2 heures d'inactivité max
-const DEFAULT_PASSWORD = '123456789';
-
-// Reproduit exactement le calcul de date du front-end (voir monthMeta() dans public/index.html) :
-// les mois vont de JUILLET 2026 (index 0) à JUILLET 2027, dans l'ordre.
-function monthDate(months, monthLabel, day) {
-  const idx = months.indexOf(monthLabel);
-  if (idx === -1) return null;
-  const startY = 2026, startM = 6; // juillet, 0-indexé
-  const total = startM + idx;
-  const y = startY + Math.floor(total / 12);
-  const m = total % 12;
-  return new Date(y, m, day);
-}
-
-// Pour un compte activité : remplace, dans "incoming", toute journée déjà passée par la valeur
-// actuellement enregistrée côté serveur — un compte activité ne peut jamais modifier le passé,
-// même en trafiquant la requête. Seul l'admin peut corriger une journée passée (autre route).
-function enforceMidnightLock(months, existingActivityData, incomingActivityData) {
-  const today = new Date(); today.setHours(0, 0, 0, 0);
-  const result = {};
-  for (const month of Object.keys(incomingActivityData)) {
-    const incomingDays = incomingActivityData[month];
-    const existingDays = (existingActivityData && existingActivityData[month]) || [];
-    if (!Array.isArray(incomingDays)) continue;
-    result[month] = incomingDays.map((pair, idx) => {
-      const day = idx + 1;
-      const cellDate = monthDate(months, month, day);
-      const isPast = cellDate && cellDate.getTime() < today.getTime();
-      if (isPast && existingDays[idx]) return existingDays[idx]; // ignore toute modification du passé
-      return pair;
-    });
-  }
-  return result;
-}
+const DEFAULT_PASSWORD = '123456789';   // mot de passe initial des nouveaux comptes
+const RESET_PASSWORD = '000000000';     // mot de passe après une réinitialisation par un admin (9 zéros)
 
 // ============================================================
 // Schéma (phase 1 : authentification de base, sur l'état existant)
@@ -94,20 +75,37 @@ async function ensureTables() {
   `);
   // pgcrypto pour gen_random_uuid() — au cas où l'extension ne serait pas déjà active
   await pool.query(`CREATE EXTENSION IF NOT EXISTS pgcrypto`).catch(() => {});
+
+  // Gestion des comptes : super admin, créateur de chaque compte, état du mot de passe.
+  // pw_status : 'initial' (mot de passe de création), 'reset' (réinitialisé à 000000000), 'perso' (choisi par l'utilisateur).
+  // Le mot de passe lui-même n'est jamais stocké en clair : seul son hash bcrypt est conservé.
+  await pool.query(`
+    ALTER TABLE accounts ADD COLUMN IF NOT EXISTS is_super BOOLEAN NOT NULL DEFAULT false;
+    ALTER TABLE accounts ADD COLUMN IF NOT EXISTS created_by UUID REFERENCES accounts(id) ON DELETE SET NULL;
+    ALTER TABLE accounts ADD COLUMN IF NOT EXISTS pw_status TEXT;
+  `);
+  await pool.query(`UPDATE accounts SET pw_status = CASE WHEN must_change_password THEN 'initial' ELSE 'perso' END WHERE pw_status IS NULL`);
+}
+
+async function getSuperAdminId() {
+  const r = await pool.query('SELECT id FROM accounts WHERE is_super = true LIMIT 1');
+  return r.rows.length ? r.rows[0].id : null;
 }
 
 // Garantit qu'un compte activité existe pour chaque nom d'activité de la liste donnée.
 // Idempotent (ON CONFLICT DO NOTHING) — peut être rappelée à chaque sauvegarde admin.
-async function ensureActivityAccounts(activityNames) {
+// creatorId : le compte admin qui a ajouté l'activité (il pourra ensuite réinitialiser son mot de passe).
+async function ensureActivityAccounts(activityNames, creatorId) {
   if (!activityNames || !activityNames.length) return;
   const hash = await bcrypt.hash(DEFAULT_PASSWORD, 10);
+  const creator = creatorId || await getSuperAdminId();
   for (const nom of activityNames) {
     const r = await pool.query(
-      `INSERT INTO accounts (role, identifiant, password_hash, must_change_password, activite_nom)
-       VALUES ('activite', $1, $2, true, $1)
+      `INSERT INTO accounts (role, identifiant, password_hash, must_change_password, activite_nom, created_by, pw_status)
+       VALUES ('activite', $1, $2, true, $1, $3, 'initial')
        ON CONFLICT (identifiant) DO NOTHING
        RETURNING id`,
-      [nom, hash]
+      [nom, hash, creator]
     );
     if (r.rows.length) console.log('Nouveau compte activité créé pour "' + nom + '" (mot de passe par défaut ' + DEFAULT_PASSWORD + ')');
   }
@@ -117,11 +115,20 @@ async function ensureActivityAccounts(activityNames) {
 async function seedAccountsIfEmpty() {
   const hash = await bcrypt.hash(DEFAULT_PASSWORD, 10);
   await pool.query(
-    `INSERT INTO accounts (role, identifiant, password_hash, must_change_password, activite_nom)
-     VALUES ('admin', 'admin', $1, true, NULL)
+    `INSERT INTO accounts (role, identifiant, password_hash, must_change_password, activite_nom, is_super, pw_status)
+     VALUES ('admin', 'admin', $1, true, NULL, true, 'initial')
      ON CONFLICT (identifiant) DO NOTHING`,
     [hash]
   );
+  // Le compte « admin » d'origine (le concessionnaire) est le super admin, y compris sur une base existante.
+  if (!(await getSuperAdminId())) {
+    await pool.query(`UPDATE accounts SET is_super = true, role = 'admin' WHERE identifiant = 'admin'`);
+  }
+  const superId = await getSuperAdminId();
+  // Comptes existants sans créateur connu : rattachés au super admin.
+  if (superId) {
+    await pool.query('UPDATE accounts SET created_by = $1 WHERE created_by IS NULL AND id <> $1', [superId]);
+  }
   const stateRes = await pool.query('SELECT data FROM app_state WHERE id = 1');
   const activities = (stateRes.rows[0] && stateRes.rows[0].data && stateRes.rows[0].data.activities) || [];
   await ensureActivityAccounts(activities);
@@ -144,7 +151,7 @@ async function getSessionAccount(token) {
   if (!token) return null;
   const r = await pool.query(
     `SELECT s.token, s.expires_at, a.id, a.role, a.identifiant, a.statut,
-            a.must_change_password, a.activite_nom
+            a.must_change_password, a.activite_nom, a.is_super
      FROM sessions s JOIN accounts a ON a.id = s.account_id
      WHERE s.token = $1`,
     [token]
@@ -167,7 +174,8 @@ async function getSessionAccount(token) {
     role: row.role,
     identifiant: row.identifiant,
     mustChangePassword: row.must_change_password,
-    activiteNom: row.activite_nom
+    activiteNom: row.activite_nom,
+    isSuper: row.is_super
   };
 }
 
@@ -180,6 +188,8 @@ function setSessionCookie(res, token) {
   });
 }
 
+const MUST_CHANGE_ALLOWED = ['/api/auth/me', '/api/auth/change-password'];
+
 async function requireAuth(req, res, next) {
   try {
     const token = req.cookies[SESSION_COOKIE];
@@ -189,6 +199,10 @@ async function requireAuth(req, res, next) {
       return res.status(403).json({ error: 'account_blocked', message: 'Votre compte est bloqué, veuillez contacter votre concessionnaire' });
     }
     req.account = account;
+    // Mot de passe temporaire : rien d'autre n'est autorisé tant qu'il n'a pas été remplacé.
+    if (account.mustChangePassword && !MUST_CHANGE_ALLOWED.includes(req.path)) {
+      return res.status(403).json({ error: 'must_change_password', message: 'Vous devez d\'abord choisir un nouveau mot de passe.' });
+    }
     next();
   } catch (e) {
     console.error('requireAuth error:', e.message);
@@ -202,15 +216,59 @@ function requireAdmin(req, res, next) {
 }
 
 // ============================================================
+// Limite de tentatives de connexion (anti-devinette des mots de passe par défaut)
+// 5 échecs pour un même identifiant ou une même IP → blocage 15 minutes.
+// ============================================================
+const LOGIN_MAX_FAILS_ID = 5;    // par identifiant
+const LOGIN_MAX_FAILS_IP = 20;   // par adresse IP (plus large : plusieurs agents peuvent partager une connexion)
+const LOGIN_LOCK_MS = 15 * 60 * 1000;
+const loginFails = new Map(); // clé -> { count, until }
+
+function loginMax(k) { return k.startsWith('ip:') ? LOGIN_MAX_FAILS_IP : LOGIN_MAX_FAILS_ID; }
+function loginLockedFor(keys) {
+  const now = Date.now();
+  for (const k of keys) {
+    const e = loginFails.get(k);
+    if (e && e.until > now) return Math.ceil((e.until - now) / 60000);
+  }
+  return 0;
+}
+function loginRecordFail(keys) {
+  const now = Date.now();
+  for (const k of keys) {
+    let e = loginFails.get(k);
+    if (!e || (e.until && e.until <= now) || now - e.first > LOGIN_LOCK_MS) e = { count: 0, until: 0, first: now };
+    e.count += 1;
+    if (e.count >= loginMax(k)) e.until = now + LOGIN_LOCK_MS;
+    loginFails.set(k, e);
+  }
+}
+function loginClear(keys) { for (const k of keys) loginFails.delete(k); }
+// Nettoyage périodique de la mémoire
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, e] of loginFails) if (e.until <= now && now - e.first > LOGIN_LOCK_MS) loginFails.delete(k);
+}, 30 * 60 * 1000).unref();
+
+// Mots de passe connus de tous : interdits comme mot de passe personnel.
+const FORBIDDEN_PASSWORDS = [DEFAULT_PASSWORD, RESET_PASSWORD, '00000000', '123456', '12345678', '000000'];
+
+// ============================================================
 // Routes d'authentification
 // ============================================================
 app.post('/api/auth/login', async (req, res) => {
   const { identifiant, password } = req.body || {};
   if (!identifiant || !password) return res.status(400).json({ error: 'missing_fields' });
 
+  const keys = ['ip:' + req.ip, 'id:' + String(identifiant).toLowerCase()];
+  const wait = loginLockedFor(keys);
+  if (wait) {
+    return res.status(429).json({ error: 'too_many_attempts', message: 'Trop de tentatives. Réessayez dans ' + wait + ' minute(s).' });
+  }
+
   try {
     const r = await pool.query('SELECT * FROM accounts WHERE identifiant = $1', [identifiant]);
-    if (r.rows.length === 0) return res.status(401).json({ error: 'invalid_credentials' });
+    if (r.rows.length === 0) { loginRecordFail(keys); return res.status(401).json({ error: 'invalid_credentials' }); }
     const account = r.rows[0];
 
     if (account.statut === 'bloque') {
@@ -218,7 +276,8 @@ app.post('/api/auth/login', async (req, res) => {
     }
 
     const ok = await bcrypt.compare(password, account.password_hash);
-    if (!ok) return res.status(401).json({ error: 'invalid_credentials' });
+    if (!ok) { loginRecordFail(keys); return res.status(401).json({ error: 'invalid_credentials' }); }
+    loginClear(keys);
 
     const { token } = await createSession(account.id);
     setSessionCookie(res, token);
@@ -226,7 +285,8 @@ app.post('/api/auth/login', async (req, res) => {
       role: account.role,
       identifiant: account.identifiant,
       mustChangePassword: account.must_change_password,
-      activiteNom: account.activite_nom
+      activiteNom: account.activite_nom,
+      isSuper: account.is_super
     });
   } catch (e) {
     console.error('POST /api/auth/login error:', e.message);
@@ -246,7 +306,8 @@ app.get('/api/auth/me', requireAuth, (req, res) => {
     role: req.account.role,
     identifiant: req.account.identifiant,
     mustChangePassword: req.account.mustChangePassword,
-    activiteNom: req.account.activiteNom
+    activiteNom: req.account.activiteNom,
+    isSuper: !!req.account.isSuper
   });
 });
 
@@ -254,6 +315,9 @@ app.post('/api/auth/change-password', requireAuth, async (req, res) => {
   const { currentPassword, newPassword } = req.body || {};
   if (!newPassword || newPassword.length < 6) {
     return res.status(400).json({ error: 'weak_password', message: 'Le nouveau mot de passe doit faire au moins 6 caractères.' });
+  }
+  if (FORBIDDEN_PASSWORDS.includes(String(newPassword)) || /^(.)\1+$/.test(String(newPassword))) {
+    return res.status(400).json({ error: 'weak_password', message: 'Ce mot de passe est trop simple (mot de passe par défaut ou un seul caractère répété). Choisissez-en un autre.' });
   }
   try {
     const r = await pool.query('SELECT password_hash FROM accounts WHERE id = $1', [req.account.accountId]);
@@ -268,7 +332,7 @@ app.post('/api/auth/change-password', requireAuth, async (req, res) => {
 
     const newHash = await bcrypt.hash(newPassword, 10);
     await pool.query(
-      'UPDATE accounts SET password_hash = $1, must_change_password = false, updated_at = now() WHERE id = $2',
+      "UPDATE accounts SET password_hash = $1, must_change_password = false, pw_status = 'perso', updated_at = now() WHERE id = $2",
       [newHash, req.account.accountId]
     );
     res.json({ ok: true });
@@ -319,7 +383,7 @@ app.put('/api/state', requireAuth, async (req, res) => {
          ON CONFLICT (id) DO UPDATE SET data = $1, updated_at = now()`,
         [incoming]
       );
-      ensureActivityAccounts(incoming.activities).catch((e) => console.error('ensureActivityAccounts error:', e.message));
+      ensureActivityAccounts(incoming.activities, req.account.accountId).catch((e) => console.error('ensureActivityAccounts error:', e.message));
       return res.json({ ok: true });
     }
 
@@ -334,8 +398,7 @@ app.put('/api/state', requireAuth, async (req, res) => {
     if (!ownIncoming) return res.status(400).json({ error: 'invalid_body' });
 
     full.data = full.data || {};
-    const existingOwn = full.data[nom] || {};
-    full.data[nom] = enforceMidnightLock(full.months || [], existingOwn, ownIncoming);
+    full.data[nom] = ownIncoming;
 
     await pool.query(
       `INSERT INTO app_state (id, data, updated_at) VALUES (1, $1, now())
@@ -346,6 +409,123 @@ app.put('/api/state', requireAuth, async (req, res) => {
   } catch (e) {
     console.error('PUT /api/state error:', e.message);
     res.status(500).json({ error: 'db_error' });
+  }
+});
+
+// ============================================================
+// Gestion des comptes (menu « GESTION DES COMPTES » des paramètres admin)
+// Toutes les règles sont vérifiées ici, côté serveur — l'interface ne fait que les refléter.
+// ============================================================
+
+// Le super admin voit et gère tous les comptes ; un autre admin ne voit que les comptes qu'il a créés.
+function canManageAccount(actor, target) {
+  if (!target || target.is_super) return false;          // le super admin est protégé
+  if (target.id === actor.accountId) return false;       // son propre mot de passe se change autrement
+  if (actor.isSuper) return true;
+  return target.created_by === actor.accountId;
+}
+
+async function findAccount(id) {
+  if (!/^[0-9a-f-]{36}$/i.test(String(id))) return null;
+  const r = await pool.query('SELECT id, role, identifiant, is_super, created_by, activite_nom FROM accounts WHERE id = $1', [id]);
+  return r.rows[0] || null;
+}
+
+app.get('/api/accounts', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const params = [];
+    let where = '';
+    if (!req.account.isSuper) { params.push(req.account.accountId); where = 'WHERE a.created_by = $1'; }
+    const r = await pool.query(
+      `SELECT a.id, a.identifiant, a.role, a.is_super, a.activite_nom, a.statut, a.pw_status,
+              a.must_change_password, a.created_by, c.identifiant AS created_by_identifiant
+         FROM accounts a LEFT JOIN accounts c ON c.id = a.created_by
+         ${where}
+        ORDER BY a.is_super DESC, a.role, a.identifiant`, params
+    );
+    // Jamais de hash ni de mot de passe dans la réponse : uniquement l'état du mot de passe.
+    res.json({
+      viewerIsSuper: !!req.account.isSuper,
+      viewerId: req.account.accountId,
+      resetPassword: RESET_PASSWORD,
+      defaultPassword: DEFAULT_PASSWORD,
+      accounts: r.rows.map((a) => ({
+        id: a.id,
+        identifiant: a.identifiant,
+        role: a.role,
+        isSuper: a.is_super,
+        activiteNom: a.activite_nom,
+        statut: a.statut,
+        pwStatus: a.pw_status,
+        createdBy: a.created_by_identifiant,
+        canReset: canManageAccount(req.account, a),
+        canChangeRole: !!req.account.isSuper && !a.is_super && a.id !== req.account.accountId && !!a.activite_nom
+      }))
+    });
+  } catch (e) {
+    console.error('GET /api/accounts error:', e.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+app.post('/api/accounts/:id/reset-password', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const target = await findAccount(req.params.id);
+    if (!target) return res.status(404).json({ error: 'not_found', message: 'Compte introuvable.' });
+    if (!canManageAccount(req.account, target)) {
+      return res.status(403).json({ error: 'forbidden', message: 'Vous ne pouvez réinitialiser que les mots de passe des comptes que vous avez créés.' });
+    }
+    const hash = await bcrypt.hash(RESET_PASSWORD, 10);
+    await pool.query(
+      "UPDATE accounts SET password_hash = $1, must_change_password = true, pw_status = 'reset', updated_at = now() WHERE id = $2",
+      [hash, target.id]
+    );
+    // L'utilisateur est déconnecté partout et devra se reconnecter avec 000000000, puis choisir son mot de passe.
+    await pool.query('DELETE FROM sessions WHERE account_id = $1', [target.id]);
+    console.log('Mot de passe de « ' + target.identifiant + ' » réinitialisé par « ' + req.account.identifiant + ' »');
+    res.json({ ok: true, message: 'Mot de passe réinitialisé avec succès' });
+  } catch (e) {
+    console.error('POST /api/accounts/:id/reset-password error:', e.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+// Changement de rôle (agent ⇄ admin) : super admin uniquement.
+// Seuls les comptes rattachés à une activité peuvent changer de rôle (un agent a besoin d'une activité).
+app.post('/api/accounts/:id/role', requireAuth, requireAdmin, async (req, res) => {
+  if (!req.account.isSuper) {
+    return res.status(403).json({ error: 'forbidden', message: 'Seul le super admin peut modifier les droits d\'un compte.' });
+  }
+  const newRole = req.body && req.body.role;
+  if (newRole !== 'admin' && newRole !== 'activite') return res.status(400).json({ error: 'invalid_role' });
+  const client = await pool.connect();
+  try {
+    const target = await findAccount(req.params.id);
+    if (!target) return res.status(404).json({ error: 'not_found', message: 'Compte introuvable.' });
+    if (target.is_super || target.id === req.account.accountId) {
+      return res.status(403).json({ error: 'forbidden', message: 'Le rôle du super admin ne peut pas être modifié.' });
+    }
+    if (!target.activite_nom) {
+      return res.status(400).json({ error: 'no_activity', message: 'Ce compte n\'est rattaché à aucune activité : il ne peut pas devenir agent.' });
+    }
+    if (target.role === newRole) return res.json({ ok: true });
+    await client.query('BEGIN');
+    if (target.role === 'admin' && newRole === 'activite') {
+      // En redevenant agent, les comptes qu'il avait créés sont rattachés au super admin.
+      await client.query('UPDATE accounts SET created_by = $1 WHERE created_by = $2', [req.account.accountId, target.id]);
+    }
+    await client.query('UPDATE accounts SET role = $1, updated_at = now() WHERE id = $2', [newRole, target.id]);
+    // Ses droits changent : il doit se reconnecter pour les obtenir.
+    await client.query('DELETE FROM sessions WHERE account_id = $1', [target.id]);
+    await client.query('COMMIT');
+    console.log('Rôle de « ' + target.identifiant + ' » : ' + target.role + ' → ' + newRole + ' (par « ' + req.account.identifiant + ' »)');
+    res.json({ ok: true });
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('POST /api/accounts/:id/role error:', e.message);
+    res.status(500).json({ error: 'server_error' });
+  } finally {
+    client.release();
   }
 });
 
