@@ -192,7 +192,7 @@
     border-top:2px solid var(--gold); font-weight:700; background: var(--paper-2);
   }
   td.rowday{ color:var(--ink-soft); width:46px; }
-  td.rowdate{ color:var(--ink-soft); width:110px; }
+  td.rowdate{ color:var(--ink-soft); width:110px; white-space:nowrap; }
 
   .cell-input{
     width:100%; min-width:90px; text-align:right;
@@ -202,6 +202,10 @@
   }
   .cell-input:hover{ border-color:var(--line); }
   .cell-input:focus{ border-color:var(--gold); background:var(--paper); outline:none; }
+  .cell-input:disabled{ cursor:not-allowed; opacity:0.6; background:transparent; }
+  tr.locked td{ background:var(--paper-2); }
+  tr.locked td.rowdate::after{ content:" \1F512"; font-size:10px; }
+  .lock-note{ font-size:12px; color:var(--ink-soft); margin:0 0 10px 0; }
 
   .table-scroll{ max-height:56vh; overflow:auto; }
   .table-scroll thead th{ position:sticky; top:0; z-index:2; }
@@ -380,6 +384,7 @@
         <span class="spacer"></span>
         <span class="msg" id="saisie-rates-note" style="font-size:11.5px; color:var(--ink-soft);"></span>
       </div>
+      <p class="lock-note" id="saisie-lock-note" style="display:none;"></p>
       <div class="table-wrap">
         <div class="table-scroll">
           <table>
@@ -498,30 +503,67 @@
     return STATE.activityRates[activity] || STATE.defaultRates || DEFAULT_RATES;
   }
 
+  /* ---------- Date du jour (fuseau de l'activité, heure du serveur) ---------- */
+  var MONTH_NAMES = ["JANVIER","FÉVRIER","MARS","AVRIL","MAI","JUIN","JUILLET","AOÛT","SEPTEMBRE","OCTOBRE","NOVEMBRE","DÉCEMBRE"];
+  var APP_TIMEZONE = 'Africa/Abidjan';
+  var SERVER_OFFSET_MS = 0; // écart entre l'horloge du serveur et celle de l'appareil
+
+  // {y, m (1-12), d} d'aujourd'hui, dans le fuseau de l'activité.
+  function todayParts(){
+    var now = new Date(Date.now() + SERVER_OFFSET_MS);
+    var s;
+    try{ s = new Intl.DateTimeFormat('en-CA', {timeZone: APP_TIMEZONE, year:'numeric', month:'2-digit', day:'2-digit'}).format(now); }
+    catch(e){ s = now.toISOString().slice(0,10); }
+    var p = s.split('-');
+    return {y: +p[0], m: +p[1], d: +p[2]};
+  }
+  function todayKey(){ var t = todayParts(); return t.y*10000 + t.m*100 + t.d; }
+
+  // « OCTOBRE 2026 » → {year:2026, monthIndex:9} (null si libellé inconnu)
+  function monthMeta(label){
+    var m = /^(\S+)\s+(\d{4})$/.exec(String(label||'').trim());
+    if(!m) return null;
+    var mi = MONTH_NAMES.indexOf(m[1].toUpperCase());
+    if(mi === -1) return null;
+    return {year: +m[2], monthIndex: mi};
+  }
+  function dayKey(label, day){
+    var meta = monthMeta(label);
+    return meta ? meta.year*10000 + (meta.monthIndex+1)*100 + day : null;
+  }
+
+  // Mois affiché par défaut : le mois en cours. S'il n'est pas dans la liste, le mois le plus proche.
+  function defaultMonth(){
+    var t = todayParts();
+    var label = MONTH_NAMES[t.m-1] + ' ' + t.y;
+    if(MONTHS.indexOf(label) !== -1) return label;
+    var target = t.y*12 + (t.m-1), best = MONTHS[0], bestDist = Infinity;
+    MONTHS.forEach(function(mo){
+      var meta = monthMeta(mo); if(!meta) return;
+      var d = Math.abs(meta.year*12 + meta.monthIndex - target);
+      if(d < bestDist){ bestDist = d; best = mo; }
+    });
+    return best;
+  }
+
+  // Verrou de minuit : pour un agent, toute journée antérieure à aujourd'hui est en lecture seule.
+  // Les admins (concessionnaires) ne sont jamais verrouillés. Le serveur applique la même règle.
+  function isAgent(){ return !!(SESSION && SESSION.role !== 'admin'); }
+  function isDayLocked(label, day){
+    if(!isAgent()) return false;
+    var k = dayKey(label, day);
+    return k === null || k < todayKey();
+  }
+
   var current = {
     view: 'saisie',
     activity: STATE.activities[0],
-    saisieMonth: STATE.currentMonth || MONTHS[2],
-    hebdoMonth: STATE.currentMonth || MONTHS[2],
-    syntheseMonth: STATE.currentMonth || MONTHS[2]
+    saisieMonth: defaultMonth(),
+    hebdoMonth: defaultMonth(),
+    syntheseMonth: defaultMonth()
   };
-
-  var MONTH_NUM = {};
-  (function(){
-    var names = ["JUILLET","AOÛT","SEPTEMBRE","OCTOBRE","NOVEMBRE","DÉCEMBRE","JANVIER","FÉVRIER","MARS","AVRIL","MAI","JUIN"];
-    // map month label -> {y,m} using order in MONTHS (13 consecutive months starting July 2026)
-  })();
-
-  function monthMeta(label){
-    var idx = MONTHS.indexOf(label);
-    var startY = 2026, startM = 6; // 0-indexed month, July = 6
-    var total = startM + idx;
-    var y = startY + Math.floor(total/12);
-    var m = total % 12; // 0-indexed
-    return {year:y, monthIndex:m};
-  }
   function fmtDate(label, day){
-    var meta = monthMeta(label);
+    var meta = monthMeta(label) || {year:'', monthIndex:0};
     var dd = String(day).padStart(2,'0');
     var mm = String(meta.monthIndex+1).padStart(2,'0');
     return dd+"/"+mm+"/"+meta.year;
@@ -639,18 +681,36 @@
       return;
     }
     if(res.status === 401){
-      SESSION = null;
-      showLoginForm();
-      showAuthGate();
+      sessionClosed();
       return;
     }
     if(res.ok){
+      var okBody = await res.json().catch(function(){ return {}; });
       STATE_VERSION = res.headers.get('X-State-Version') || STATE_VERSION;
+      // Agent : on reprend exactement ce que le serveur a enregistré (les journées verrouillées n'ont pas bougé).
+      if(isAgent() && okBody.data && SESSION.activiteNom){
+        STATE.data[SESSION.activiteNom] = okBody.data;
+      }
       BASE_STATE = deepCopy(STATE);
       PENDING_RENAMES = [];
       dirty = false;
-      if(el){ el.textContent = successMsg; }
-      showToast('Modifications enregistrées.');
+      var finalMsg = successMsg;
+      if(okBody.refused){
+        finalMsg += ' ' + okBody.refused + ' journée(s) déjà clôturée(s) n\'ont pas été modifiée(s).';
+        if(current.view === 'saisie') renderSaisie();
+      }
+      if(el){ el.textContent = finalMsg; }
+      showToast(okBody.refused ? 'Enregistré, sauf les journées clôturées.' : 'Modifications enregistrées.');
+      // Comptes renommés : leur identifiant de connexion est devenu leur nouveau nom.
+      if(Array.isArray(okBody.renamed) && okBody.renamed.length){
+        var lines = okBody.renamed.map(function(r){
+          if(r.self && SESSION){ SESSION.identifiant = r.identifiant; SESSION.activiteNom = r.activite; applyRoleToUI(); }
+          return '• ' + r.activite + ' : identifiant « ' + r.ancien + ' » → « ' + r.identifiant + ' »';
+        });
+        alert('Identifiants mis à jour (le mot de passe ne change pas) :\n\n' + lines.join('\n') +
+              '\n\nLes comptes concernés ont été déconnectés et doivent se reconnecter avec leur nouvel identifiant.');
+      }
+      if(el && el.id === 'saisie-status') applySaisieLocks();
       try{ localStorage.setItem('lonaloto_backup', JSON.stringify(STATE)); }catch(e){}
       return;
     }
@@ -767,19 +827,56 @@
       tbody.appendChild(tr);
     });
 
-    tbody.addEventListener('input', function(e){
+    // Un seul gestionnaire (oninput remplace le précédent à chaque affichage).
+    tbody.oninput = function(e){
       var inp = e.target.closest('input.cell-input');
-      if(!inp) return;
+      if(!inp || inp.disabled) return;
       var i = parseInt(inp.getAttribute('data-i'),10);
       var f = parseInt(inp.getAttribute('data-f'),10);
       draftDays[i][f] = num(inp.value);
       renderSaisieCards();
       markDirty('Modifications non enregistrées pour '+current.saisieMonth+'.', 'saisie-status');
-    }, {once:false});
+    };
 
+    applySaisieLocks();
     renderSaisieCards();
     document.getElementById('saisie-status').textContent = 'Aucune modification en attente.';
   }
+
+  // Grise les journées verrouillées (agents) et affiche la note explicative.
+  var LOCK_DAY = null;
+  function applySaisieLocks(){
+    LOCK_DAY = todayKey();
+    var rows = document.querySelectorAll('#saisie-tbody tr');
+    var lockedCount = 0;
+    rows.forEach(function(tr, idx){
+      var locked = isDayLocked(current.saisieMonth, idx+1);
+      if(locked) lockedCount++;
+      tr.classList.toggle('locked', locked);
+      tr.querySelectorAll('input.cell-input').forEach(function(inp){
+        inp.disabled = locked;
+        inp.title = locked ? 'Journée clôturée à minuit : seul le concessionnaire peut la modifier.' : '';
+      });
+    });
+    var note = document.getElementById('saisie-lock-note');
+    if(note){
+      if(isAgent() && lockedCount){
+        note.textContent = '🔒 Les journées passées sont clôturées chaque jour à minuit et ne peuvent plus être ajoutées ni modifiées. Pour une correction, contactez votre concessionnaire.';
+        note.style.display = '';
+      } else {
+        note.style.display = 'none';
+      }
+    }
+    var saveBtn = document.getElementById('saisie-save-btn');
+    if(saveBtn) saveBtn.disabled = isAgent() && rows.length > 0 && lockedCount === rows.length;
+  }
+
+  // Passage de minuit alors que la page est ouverte : on verrouille aussitôt les journées concernées.
+  setInterval(function(){
+    if(!SESSION || LOCK_DAY === null || todayKey() === LOCK_DAY) return;
+    if(current.view === 'saisie') applySaisieLocks();
+    if(isAgent() && dirty) showToast('Minuit est passé : la journée d\'hier est désormais clôturée.');
+  }, 30000);
 
   function renderSaisieCards(){
     var t = computeTotals(draftDays, getActivityRates(current.activity));
@@ -1095,7 +1192,7 @@
     var body = {};
     try{ body = await res.json(); }catch(e){}
     if(res.status === 401){
-      SESSION = null; showLoginForm(); showAuthGate();
+      sessionClosed();
       throw new Error('Session expirée — reconnectez-vous.');
     }
     if(!res.ok) throw new Error(body.message || 'Une erreur est survenue.');
@@ -1282,6 +1379,18 @@
     document.getElementById('login-form').style.display = 'block';
     document.getElementById('change-password-form').style.display = 'none';
   }
+  // Session fermée par le serveur (expiration, changement de nom/identifiant, de droits ou réinitialisation).
+  function sessionClosed(){
+    var wasLogged = !!SESSION;
+    SESSION = null;
+    showLoginForm();
+    showAuthGate();
+    if(wasLogged){
+      var errEl = document.getElementById('login-error');
+      errEl.textContent = 'Votre session a été fermée. Reconnectez-vous. Si le nom de votre compte a changé, votre identifiant est désormais ce nouveau nom (sans accents ni espaces, en minuscules) — le mot de passe reste le même.';
+      errEl.style.display = 'block';
+    }
+  }
   function showChangePasswordForm(){
     document.getElementById('login-form').style.display = 'none';
     document.getElementById('change-password-form').style.display = 'block';
@@ -1411,15 +1520,16 @@
     try{
       var res = await fetch('/api/state', {cache:'no-store'});
       if(res.status === 401){
-        // Session expirée entre-temps : retour à l'écran de connexion.
-        SESSION = null;
-        showLoginForm();
-        showAuthGate();
+        // Session fermée entre-temps : retour à l'écran de connexion.
+        sessionClosed();
         return;
       }
       if(res.ok){
         var remote = await res.json();
         STATE_VERSION = res.headers.get('X-State-Version');
+        var st = Number(res.headers.get('X-Server-Time'));
+        if(st) SERVER_OFFSET_MS = st - Date.now();
+        if(res.headers.get('X-App-Timezone')) APP_TIMEZONE = res.headers.get('X-App-Timezone');
         if(remote){
           STATE = remote;
           BASE_STATE = deepCopy(remote);
@@ -1444,7 +1554,7 @@
     runMigrations();
     MONTHS = STATE.months;
     DAYS_IN_MONTH = STATE.daysInMonth;
-    current.saisieMonth = STATE.currentMonth || MONTHS[2];
+    current.saisieMonth = defaultMonth(); // toujours le mois en cours à l'ouverture
     current.hebdoMonth = current.saisieMonth;
     current.syntheseMonth = current.saisieMonth;
     current.activity = STATE.activities[0];
