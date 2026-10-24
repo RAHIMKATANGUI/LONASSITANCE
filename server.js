@@ -77,9 +77,12 @@ function dayKey(monthLabel, day) {
 
 // Pour un compte agent : toute journée passée reprend la valeur déjà enregistrée sur le serveur
 // (ou reste vide), quoi que contienne la requête. Les mois non envoyés sont conservés.
+// Renvoie { data, refused } : refused = nombre de journées passées que l'agent a tenté de modifier.
 function enforceMidnightLock(existingActivityData, incomingActivityData) {
   const today = todayKey();
   const result = Object.assign({}, existingActivityData || {});
+  let refused = 0;
+  const same = (a, b) => Number((a || [])[0] || 0) === Number((b || [])[0] || 0) && Number((a || [])[1] || 0) === Number((b || [])[1] || 0);
   for (const month of Object.keys(incomingActivityData || {})) {
     const incomingDays = incomingActivityData[month];
     if (!Array.isArray(incomingDays)) continue;
@@ -87,11 +90,14 @@ function enforceMidnightLock(existingActivityData, incomingActivityData) {
     result[month] = incomingDays.map((pair, idx) => {
       const k = dayKey(month, idx + 1);
       const isPast = k === null || k < today; // libellé inconnu : verrouillé par prudence
-      if (isPast) return existingDays[idx] || [0, 0];
+      if (isPast) {
+        if (!same(pair, existingDays[idx])) refused += 1;
+        return existingDays[idx] || [0, 0];
+      }
       return pair;
     });
   }
-  return result;
+  return { data: result, refused };
 }
 
 // ============================================================
@@ -137,6 +143,7 @@ async function ensureTables() {
     ALTER TABLE accounts ADD COLUMN IF NOT EXISTS is_super BOOLEAN NOT NULL DEFAULT false;
     ALTER TABLE accounts ADD COLUMN IF NOT EXISTS created_by UUID REFERENCES accounts(id) ON DELETE SET NULL;
     ALTER TABLE accounts ADD COLUMN IF NOT EXISTS pw_status TEXT;
+    ALTER TABLE accounts ADD COLUMN IF NOT EXISTS ancien_identifiant TEXT;
   `);
   await pool.query(`UPDATE accounts SET pw_status = CASE WHEN must_change_password THEN 'initial' ELSE 'perso' END WHERE pw_status IS NULL`);
 }
@@ -209,14 +216,21 @@ async function renameActivityAccount(from, to, db, actorId) {
       throw err;
     }
   }
+  const oldLogin = acc.rows[0].identifiant;
+  const loginChanged = newLogin !== oldLogin;
+  // Nom et identifiant sont mis à jour ensemble, dans la même transaction : l'identifiant suit toujours le nom.
+  // L'ancien identifiant est mémorisé pour pouvoir indiquer le nouveau à qui tenterait encore l'ancien.
   await db.query(
-    'UPDATE accounts SET identifiant = $1, activite_nom = $2, updated_at = now() WHERE id = $3',
-    [newLogin, to, accountId]);
+    `UPDATE accounts SET identifiant = $1, activite_nom = $2,
+            ancien_identifiant = CASE WHEN $4 THEN $5 ELSE ancien_identifiant END, updated_at = now()
+      WHERE id = $3`,
+    [newLogin, to, accountId, loginChanged, oldLogin]);
   // L'identifiant a changé : ses sessions ouvertes sont fermées, il se reconnecte avec le nouvel identifiant
-  // (même mot de passe). L'admin qui fait le changement reste connecté.
-  if (accountId !== actorId) await db.query('DELETE FROM sessions WHERE account_id = $1', [accountId]);
+  // (même mot de passe). L'admin qui fait le changement reste connecté (son badge est mis à jour).
+  // Simple changement de majuscules/accents (même identifiant normalisé) : personne n'est déconnecté.
+  if (loginChanged && accountId !== actorId) await db.query('DELETE FROM sessions WHERE account_id = $1', [accountId]);
   console.log('Compte « ' + acc.rows[0].identifiant + ' » renommé : activité « ' + to + ' », identifiant « ' + newLogin + ' ».');
-  return { activite: to, identifiant: newLogin, ancien: acc.rows[0].identifiant };
+  return { activite: to, identifiant: newLogin, ancien: oldLogin, self: accountId === actorId };
 }
 
 // Met les identifiants existants au format normalisé (une seule fois, sans effet ensuite).
@@ -227,7 +241,7 @@ async function normalizeExistingLogins() {
     const target = normalizeLogin(a.activite_nom || a.identifiant);
     if (!target || target === a.identifiant) continue;
     if (taken.has(target)) { console.warn('Identifiant « ' + a.identifiant + ' » non normalisé : « ' + target + ' » est déjà pris.'); continue; }
-    await pool.query('UPDATE accounts SET identifiant = $1, updated_at = now() WHERE id = $2', [target, a.id]);
+    await pool.query('UPDATE accounts SET identifiant = $1, ancien_identifiant = $3, updated_at = now() WHERE id = $2', [target, a.id, a.identifiant]);
     taken.delete(a.identifiant); taken.add(target);
     console.log('Identifiant « ' + a.identifiant + ' » → « ' + target + ' »');
   }
@@ -420,7 +434,15 @@ app.post('/api/auth/login', async (req, res) => {
     const r = await pool.query(
       'SELECT * FROM accounts WHERE identifiant = $1 OR identifiant = $2 ORDER BY (identifiant = $1) DESC LIMIT 1',
       [login, String(identifiant).trim()]);
-    if (r.rows.length === 0) { loginRecordFail(keys); return res.status(401).json({ error: 'invalid_credentials' }); }
+    if (r.rows.length === 0) {
+      loginRecordFail(keys);
+      // Ancien identifiant (le compte a changé de nom) : on indique le nouveau, sans jamais ouvrir de session.
+      const moved = await pool.query('SELECT identifiant FROM accounts WHERE ancien_identifiant = $1 LIMIT 1', [login]);
+      if (moved.rows.length) {
+        return res.status(401).json({ error: 'login_changed', message: 'Ce compte a changé de nom : votre identifiant est désormais « ' + moved.rows[0].identifiant + ' » (mot de passe inchangé).' });
+      }
+      return res.status(401).json({ error: 'invalid_credentials' });
+    }
     const account = r.rows[0];
 
     if (account.statut === 'bloque') {
@@ -518,6 +540,9 @@ app.get('/api/state', requireAuth, async (req, res) => {
     // Version de l'état : renvoyée à chaque enregistrement admin pour détecter qu'un autre utilisateur
     // a enregistré entre-temps (sinon l'admin écraserait sans le savoir les saisies des agents).
     if (r.rows.length) res.setHeader('X-State-Version', r.rows[0].v);
+    // Heure du serveur : l'interface s'en sert pour savoir quelles journées sont verrouillées (sans dépendre de l'horloge du téléphone).
+    res.setHeader('X-Server-Time', String(Date.now()));
+    res.setHeader('X-App-Timezone', APP_TIMEZONE);
     res.setHeader('Cache-Control', 'no-store');
     res.json(scopeStateForAccount(full, req.account));
   } catch (e) {
@@ -602,7 +627,7 @@ app.put('/api/state', requireAuth, async (req, res) => {
 
     // Verrou de minuit : un agent ne peut ni ajouter ni modifier une journée déjà passée.
     const existingOwn = (full.data && full.data[nom]) || {};
-    const lockedOwn = enforceMidnightLock(existingOwn, ownIncoming);
+    const { data: lockedOwn, refused } = enforceMidnightLock(existingOwn, ownIncoming);
 
     // Mise à jour atomique de la seule section de l'agent : deux agents qui enregistrent en même temps
     // ne peuvent plus s'écraser l'un l'autre.
@@ -613,7 +638,8 @@ app.put('/api/state', requireAuth, async (req, res) => {
         WHERE id = 1`,
       [nom, JSON.stringify(lockedOwn)]
     );
-    res.json({ ok: true });
+    // On renvoie ce qui a réellement été enregistré, et combien de journées verrouillées ont été ignorées.
+    res.json({ ok: true, data: lockedOwn, refused });
   } catch (e) {
     console.error('PUT /api/state error:', e.message);
     res.status(500).json({ error: 'db_error' });
